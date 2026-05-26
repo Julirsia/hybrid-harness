@@ -1,0 +1,7 @@
+{
+  "name": "qwen-harness-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode qwen harness skill bundle and TUI sidebar status panel.",
+  "author": "local",
+  "license": "UNLICENSED"
+}

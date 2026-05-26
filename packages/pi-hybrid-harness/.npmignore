@@ -1,0 +1,4 @@
+.pi-harness/
+.pi/
+.DS_Store
+*.log

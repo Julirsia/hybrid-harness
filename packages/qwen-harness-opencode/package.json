@@ -1,0 +1,19 @@
+{
+  "name": "qwen-harness-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode skill and TUI sidebar for .qwen-harness status, progress, blockers, and token efficiency.",
+  "scripts": {
+    "test": "node --test test/status-summary.test.mjs",
+    "install:global": "./install.sh",
+    "uninstall:global": "./uninstall.sh"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.15.6",
+    "@opentui/core": "^0.2.15",
+    "@opentui/keymap": "^0.2.15",
+    "@opentui/solid": "^0.2.15",
+    "solid-js": "^1.9.12"
+  }
+}

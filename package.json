@@ -1,0 +1,17 @@
+{
+  "name": "harnessproject",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo for Pi and OpenCode harness tooling.",
+  "workspaces": [
+    "packages/pi-hybrid-harness",
+    "packages/qwen-harness-opencode"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "test:qwen": "npm test -w qwen-harness-opencode",
+    "pack:pi": "npm run pack:dry -w pi-hybrid-harness",
+    "install:opencode": "npm run install:global -w qwen-harness-opencode",
+    "uninstall:opencode": "npm run uninstall:global -w qwen-harness-opencode"
+  }
+}

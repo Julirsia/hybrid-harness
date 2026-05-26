@@ -1,0 +1,37 @@
+{
+  "name": "pi-hybrid-harness",
+  "version": "0.2.9",
+  "description": "Pi package for frontier-designed, local-LLM implementation loops with frontier final gates.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "hybrid",
+    "local-llm",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "node --test tests/hybrid-harness-regression.test.js",
+    "pack:dry": "npm pack --dry-run",
+    "cli": "node ./bin/pi-hybrid-harness.js"
+  },
+  "bin": {
+    "pi-hybrid-harness": "bin/pi-hybrid-harness.js"
+  },
+  "files": [
+    "extensions",
+    "bin",
+    "README.md",
+    "package.json"
+  ]
+}

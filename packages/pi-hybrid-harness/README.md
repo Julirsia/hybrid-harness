@@ -1,0 +1,215 @@
+# pi-hybrid-harness
+
+Pi package for a token-saving hybrid workflow:
+
+```text
+local Qwen scout -> GPT-5.5 architect -> local Qwen implementation/test loop -> local Qwen review -> GPT-5.5 final gate
+```
+
+The goal is to spend frontier-model tokens only on high-leverage design and final validation, while using the local llama.cpp Qwen models for exploration, implementation, testing, and local review.
+
+## Defaults
+
+- State directory: `.pi-harness/`
+- Local endpoint: `http://192.168.0.44:8080/v1`
+- Local worker: `local-qwen/qwen36-27b-mtp-iq4xs`
+- Local reviewer: `local-qwen/qwen36-35b-a3b-iq4xs`
+- Frontier: `openai-codex/gpt-5.5` with `high` thinking
+
+The extension dynamically registers a `local-qwen` provider from the llama.cpp `/v1/models` endpoint. It also registers a `hybrid_run` custom tool with compact/expanded Pi TUI rendering for live harness progress.
+
+## Install / update
+
+Once published to npm, project-local install is:
+
+```bash
+npx pi-hybrid-harness install -l
+```
+
+Update later with:
+
+```bash
+npx pi-hybrid-harness update -l
+```
+
+The npx CLI is a thin wrapper around Pi package commands. The equivalent direct command for both install and project-local refresh is:
+
+```bash
+pi install -l npm:pi-hybrid-harness
+```
+
+For local development from this checkout:
+
+```bash
+npx . install -l --source .
+# or from the monorepo root:
+npx ./packages/pi-hybrid-harness install -l --source ./packages/pi-hybrid-harness
+```
+
+Then reload Pi:
+
+```text
+/reload
+```
+
+## Commands
+
+```text
+/hybrid-run <task>      # full orchestration with configured/default maxFrontierPasses (default 2)
+/hybrid-run             # resume the latest task from artifact-backed stage checkpoints
+/hybrid-run-fast <task> # token-saving mode: maxFrontierPasses forced to 1
+/hybrid-run-thorough <task> # thorough mode: maxFrontierPasses forced to 2
+/hybrid-monitor        # toggle live child-session output modal (F8 fallback shortcut)
+/hybrid-steer <note>    # queue parent steering for the next child session/stage boundary
+/hybrid-steering        # show queued/consumed parent steering notes
+/hybrid-steer-clear     # clear queued/consumed parent steering notes
+/hybrid-cancel          # cancel the active background run and current child session
+/hybrid-retry <stage>   # clear one stage checkpoint so it reruns on the next /hybrid-run
+/hybrid-resume-from <stage> # clear a stage and downstream checkpoints, then resume
+/hybrid-doctor          # endpoint, pi subprocess, git, and local model smoke check
+/hybrid-config          # create/show .pi-harness/config.json
+/hybrid-models          # pick worker/reviewer/frontier models from Pi's available models
+/hybrid-install-companions # install pi-show-diffs + pi-subagents, remove legacy pi-subagentura if present
+/hybrid-progress        # show slice, acceptance criteria, trigger, and test progress
+/hybrid-usage           # show local vs frontier recorded usage totals
+/hybrid-checkpoint      # create a git patch checkpoint
+/hybrid-rollback        # reverse-apply latest tracked checkpoint patch
+/hybrid-reset           # clear current run artifacts while keeping config/doctor
+/hybrid-start <task>    # local scout + frontier design package only
+/hybrid-loop [n]        # local implementation/test loop, default max from config
+/hybrid-review          # local read-only review over design, logs, and diff
+/hybrid-final           # frontier final gate over compressed artifact pack
+/hybrid-status          # show state and artifacts
+```
+
+Default full run policy:
+
+```text
+1. Local Qwen scout maps the repo.
+2. GPT-5.5 writes frontier-design.md.
+3. Local Qwen extracts structured progress into progress.json/progress.md: slices, acceptance criteria, frontier re-check triggers.
+4. Local Qwen implements and tests for maxLocalLoops.
+5. After each iteration, Local Qwen updates progress, classifies test failures, and chooses the next repair strategy.
+6. Local Qwen reviews.
+7. If local review is FAIL, local repair repeats up to maxReviewRepairCycles before spending more frontier tokens.
+8. If a frontier re-check trigger becomes active, the local loop stops and escalates to the frontier gate.
+9. GPT-5.5 runs the final gate.
+7. If GPT-5.5 returns REQUEST_CHANGES and maxFrontierPasses > 1, the final review is fed back into another local repair pass.
+8. APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER is written to final-review.md and run-summary.md.
+```
+
+## Artifacts
+
+The package writes durable state to `.pi-harness/`:
+
+```text
+.pi-harness/
+  state.json
+  run-state.json              # cycle-aware stage checkpoints for resume
+  active-run.json             # background run lock/heartbeat while active
+  config.json                 # optional overrides
+  task.md
+  repo-map.md
+  frontier-design.md
+  implementation-plan.json
+  progress.json
+  progress.md
+  test-evidence.md
+  local-log.md
+  orchestration-brief.md
+  user-clarifications.md
+  steering.jsonl
+  git-summary.md
+  local-review.md
+  final-review.md
+  run-summary.md
+  usage-summary.md
+  live-log.md
+  events.jsonl
+  doctor.md
+  checkpoints/
+```
+
+Resume is artifact-backed, not a live child-process continuation. If a run is interrupted, rerun `/hybrid-run` without a task or call `hybrid_run` with `resume: true`; completed stages with matching artifacts are skipped and the next incomplete child session is started fresh.
+
+Full `/hybrid-run*` commands now start in the background so the parent Pi conversation can continue. Use `/hybrid-monitor` for live output, `/hybrid-steer <note>` to add parent steering that will be read by later child sessions, and `/hybrid-cancel` to abort the active run and terminate the current child process. Steering is stage-boundary based; it is not injected into the stdin of an already-running child.
+
+Background runs write `.pi-harness/active-run.json` with a heartbeat so another Pi window can see that a run is active. Stale locks are ignored after the heartbeat expires. `/hybrid-status` reports the active lock and queued steering count. The monitor keeps `Esc`/`q` as close-only; press `x` twice or `Ctrl-C` then `x` to cancel the active run.
+
+If a child session appears stuck repeating the same tool/target pattern, the harness aborts that child with a `stuck-loop-guard` message instead of burning time indefinitely.
+
+## Optional config
+
+Create `.pi-harness/config.json`:
+
+```json
+{
+  "testCommand": "npm test",
+  "maxLocalLoops": 4,
+  "maxReviewRepairCycles": 2,
+  "maxFrontierPasses": 2,
+  "requireDeterministicTestsForInteractive": true,
+  "enableSafetyGuards": true,
+  "allowDestructiveBash": false,
+  "protectedPaths": [".env", ".env.*", "**/.env", "**/.env.*", ".git/**", "**/*secret*", "**/*credential*", "**/*token*"],
+  "maxDiffCharsBeforeFrontier": 120000,
+  "verboseChildOutput": true,
+  "liveLogMaxWidgetLines": 30,
+  "briefBeforeImplementation": true,
+  "askUserOnAmbiguity": true,
+  "frontierModel": "openai-codex/gpt-5.5",
+  "frontierThinking": "high",
+  "localWorkerModel": "local-qwen/qwen36-27b-mtp-iq4xs",
+  "localReviewerModel": "local-qwen/qwen36-35b-a3b-iq4xs"
+}
+```
+
+## Validation hardening
+
+For browser/UI/game/canvas/touch-style tasks, `requireDeterministicTestsForInteractive` defaults to `true`. With this policy enabled, syntax checks, HTTP 200 checks, screenshots without assertions, and worker self-reported smoke tests are not enough for PASS/APPROVE. Configure `testCommand` to run objective runtime assertions (for example an agent-browser or Node harness script that checks game state/DOM/canvas behavior), or the local/final gates will request changes instead of approving.
+
+## Safety and rollback
+
+The extension registers safety guards that apply to parent and child Pi sessions:
+
+- blocks `write`/`edit` to protected paths such as `.env`, `.git/**`, and secret/token/credential-looking files
+- blocks destructive bash patterns such as `rm -rf`, `sudo`, `git reset --hard`, and `git clean -fdx` unless `allowDestructiveBash` is enabled
+- creates a pre-run git patch checkpoint under `.pi-harness/checkpoints/`
+- `/hybrid-rollback` reverse-applies the latest tracked worktree patch; untracked files are not deleted automatically
+
+## Orchestration briefing and clarification
+
+Before implementation, the harness writes `.pi-harness/orchestration-brief.md` with:
+
+- plan summary
+- execution strategy
+- assumptions
+- ambiguities
+- blocking questions
+- risk level
+
+If `askUserOnAmbiguity` is enabled and the brief finds blocking ambiguity, Pi opens an editor prompt for your answers and stores them in `.pi-harness/user-clarifications.md`. The local worker and frontier final gate then read those clarifications.
+
+## Tool UI
+
+The `hybrid_run` tool provides the subagent-style card UX:
+
+- compact view: current stage, current child/tool, slice/acceptance progress, verdicts, and recent child output
+- expanded view: fuller recent output, artifact paths, and usage summary
+- `/hybrid-run`, `/hybrid-run-fast`, and `/hybrid-run-thorough` use the same run state and markdown renderer; when an agent calls `hybrid_run` directly, Pi shows the native expandable tool card.
+- `hybrid_run` defaults to background mode; set `background: false` when a caller needs to wait for the final result in the tool call.
+
+## Recommended companion packages
+
+These are intentionally not hard dependencies, but they are good companions:
+
+```bash
+pi install -l npm:pi-show-diffs@0.2.13
+pi install -l npm:pi-subagents
+pi remove -l npm:pi-subagentura@1.0.12 # optional legacy cleanup
+```
+
+- `pi-show-diffs`: safety gate before edit/write changes.
+- `pi-subagents`: mature reference/companion for delegated subagent UX, chain/parallel execution, and background jobs.
+
+Large workflow packages such as `oh-my-opencode-pi` and `@linimin/pi-letscook` are worth studying, but this package keeps the core orchestration small so frontier-token routing stays explicit.
