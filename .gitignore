@@ -20,5 +20,6 @@ build/
 .pi-lens/
 .playwright-mcp/
 .qwen-harness/
+.agent-harness/
 
 agent-handoffs/

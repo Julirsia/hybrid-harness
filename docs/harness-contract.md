@@ -1,15 +1,16 @@
 # Harness Contract
 
-This repo contains two packages that serve the same local-Qwen workflow from different host apps. The packages may use different runtime directories, but changes to durable state shape should be reflected in both packages.
+This repo contains packages that serve the same local-Qwen workflow from different host apps. The packages may use different runtime directories, but changes to durable state shape should be reflected across host packages.
 
 ## Packages
 
 | Package | Host | Main responsibility | Current state directory |
 | --- | --- | --- | --- |
 | `pi-hybrid-harness` | Pi | orchestrates local/frontier runs and writes durable run artifacts | `.pi-harness/` |
+| `qwen-harness-codex` | Codex | provides a Codex CLI/MCP bridge that delegates scout/implementation/evidence loops to Pi/local Qwen while Codex owns frontier gates | `.qwen-harness/` |
 | `qwen-harness-opencode` | OpenCode | provides a Qwen-first workflow skill and sidebar summary | `.qwen-harness/` |
 
-The OpenCode package reads `.qwen-harness/` first and falls back to `.pi-harness/` when a project already uses the Pi harness directory. Avoid creating both directories in one target project unless the user explicitly asks.
+Codex and OpenCode use `.qwen-harness/` as the canonical state directory. Do not introduce a Codex-specific harness directory. The OpenCode package reads `.qwen-harness/` first and falls back to `.pi-harness/` when a project already uses the Pi harness directory. Avoid creating both directories in one target project unless the user explicitly asks.
 
 ## Shared Concepts
 

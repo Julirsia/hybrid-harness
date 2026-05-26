@@ -1,0 +1,25 @@
+{
+  "name": "qwen-harness-codex",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Codex CLI and MCP bridge for Qwen/Pi-backed harness runs using .qwen-harness state.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "cli": "node ./bin/qwen-harness-codex.js",
+    "mcp": "node ./mcp/server.mjs"
+  },
+  "bin": {
+    "qwen-harness-codex": "bin/qwen-harness-codex.js"
+  },
+  "files": [
+    "bin",
+    "mcp",
+    "skills",
+    "src",
+    "README.md",
+    "package.json"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
