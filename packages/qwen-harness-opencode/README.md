@@ -23,6 +23,20 @@ The panel shows:
 
 Token efficiency is calculated from `tokenUsage`, `usage`, or `tokens` objects in `state.json`, `progress.json`, `implementation-plan.json`, slice evidence, and `events.jsonl`.
 
+## Verification Contract
+
+The workflow skill treats completion as a verified claim, not an implementation statement. For medium/large tasks, `implementation-plan.json` acceptance criteria should include executable `verificationContracts`, `evidenceType`, `sourceEvidence`, `runtimeEvidence`, `adversarialProbes`, `reentryProbes`, and `residualGaps`.
+
+For serious tasks, where `taskRisk` is `medium` or `high`, the workflow requires a CWS-compatible plan gate before Qwen implementation. Use `plan-review.md` or equivalent `plan-architect-review.md` and `plan-critic-review.md` artifacts, and do not start implementation until the final verdict is `READY`. `NEEDS_REVISION`, `ESCALATE_TO_USER`, or a missing verdict blocks implementation.
+
+Quality-impacting gates are frontier-owned. Qwen may gather repo facts, implement, test, and repair after READY, but `plan-review.md`, implementation review, and final review should be judged by the frontier model.
+
+For ambiguous requirements or broad design branches, use the Pi harness frontier-owned design gates before Qwen implementation: `/hybrid-interview <request-or-answer>` writes `requirements.md`, and `/hybrid-grill <plan-or-design>` writes `design-grill.md`. Qwen can gather repo facts for those gates, but the frontier model owns requirements/design judgment and implementation starts only after the gate is ready.
+
+Smoke checks such as build passed, HTTP 200, server responds, or import succeeds are baseline evidence only. They cannot satisfy behavioral acceptance criteria without unit, integration, e2e, CLI/API/UI, or manual runtime evidence.
+
+Final evidence should include a claim-evidence matrix with Claim, Evidence command, Evidence type, What would fail if broken, and Residual gap.
+
 ## Install
 
 From npm:

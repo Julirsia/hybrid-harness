@@ -3,10 +3,10 @@
 Pi package for a token-saving hybrid workflow:
 
 ```text
-local Qwen scout -> GPT-5.5 architect -> local Qwen implementation/test loop -> local Qwen review -> GPT-5.5 final gate
+local Qwen scout -> GPT-5.5 architect -> local Qwen implementation/test loop -> GPT-5.5 implementation review -> GPT-5.5 final gate
 ```
 
-The goal is to spend frontier-model tokens only on high-leverage design and final validation, while using the local llama.cpp Qwen models for exploration, implementation, testing, and local review.
+The goal is to spend frontier-model tokens on high-leverage design and quality gates, while using the local llama.cpp Qwen models for exploration, implementation, testing, repair loops, and control-plane bookkeeping.
 
 ## Defaults
 
@@ -66,6 +66,8 @@ Then reload Pi:
 /hybrid-cancel          # cancel the active background run and current child session
 /hybrid-retry <stage>   # clear one stage checkpoint so it reruns on the next /hybrid-run
 /hybrid-resume-from <stage> # clear a stage and downstream checkpoints, then resume
+/hybrid-interview <request-or-answer> # frontier-owned requirements interview; writes requirements.md
+/hybrid-grill <plan-or-design> # frontier-owned design stress test; writes design-grill.md
 /hybrid-doctor          # endpoint, pi subprocess, git, and local model smoke check
 /hybrid-config          # create/show .pi-harness/config.json
 /hybrid-models          # pick worker/reviewer/frontier models from Pi's available models
@@ -77,7 +79,7 @@ Then reload Pi:
 /hybrid-reset           # clear current run artifacts while keeping config/doctor
 /hybrid-start <task>    # local scout + frontier design package only
 /hybrid-loop [n]        # local implementation/test loop, default max from config
-/hybrid-review          # local read-only review over design, logs, and diff
+/hybrid-review          # frontier read-only implementation review over design, logs, and diff
 /hybrid-final           # frontier final gate over compressed artifact pack
 /hybrid-status          # show state and artifacts
 ```
@@ -90,8 +92,8 @@ Default full run policy:
 3. Local Qwen extracts structured progress into progress.json/progress.md: slices, acceptance criteria, frontier re-check triggers.
 4. Local Qwen implements and tests for maxLocalLoops.
 5. After each iteration, Local Qwen updates progress, classifies test failures, and chooses the next repair strategy.
-6. Local Qwen reviews.
-7. If local review is FAIL, local repair repeats up to maxReviewRepairCycles before spending more frontier tokens.
+6. GPT-5.5 reviews implementation quality.
+7. If implementation review is FAIL, local repair repeats up to maxReviewRepairCycles.
 8. If a frontier re-check trigger becomes active, the local loop stops and escalates to the frontier gate.
 9. GPT-5.5 runs the final gate.
 7. If GPT-5.5 returns REQUEST_CHANGES and maxFrontierPasses > 1, the final review is fed back into another local repair pass.
@@ -115,6 +117,10 @@ The package writes durable state to `.pi-harness/`:
   progress.json
   progress.md
   test-evidence.md
+  claim-evidence-matrix.md
+  plan-review.md
+  requirements.md
+  design-grill.md
   local-log.md
   orchestration-brief.md
   user-clarifications.md
@@ -167,6 +173,16 @@ Create `.pi-harness/config.json`:
 ## Validation hardening
 
 For browser/UI/game/canvas/touch-style tasks, `requireDeterministicTestsForInteractive` defaults to `true`. With this policy enabled, syntax checks, HTTP 200 checks, screenshots without assertions, and worker self-reported smoke tests are not enough for PASS/APPROVE. Configure `testCommand` to run objective runtime assertions (for example an agent-browser or Node harness script that checks game state/DOM/canvas behavior), or the local/final gates will request changes instead of approving.
+
+For all non-trivial tasks, the harness records acceptance criteria as executable verification contracts. Final evidence separates source evidence from runtime evidence and writes `claim-evidence-matrix.md` with Claim, Evidence command, Evidence type, What would fail if broken, and Residual gap.
+
+For ambiguous requirements or broad designs, use `/hybrid-interview` and `/hybrid-grill` before implementation. These are frontier-owned design gates: they run with `frontierModel` and `frontierThinking`, write `requirements.md` and `design-grill.md`, and do not assign implementation to local/Qwen until the requirement or design branch is ready.
+
+For serious tasks, the harness automatically runs a CWS-compatible, not CWS-dependent frontier `plan-review` stage after the orchestration brief and before the local implementation loop. `taskRisk=medium` or `taskRisk=high` must produce `plan-review.md` with plan architect and plan critic verdicts; local implementation starts only when the final verdict is `READY`. `NEEDS_REVISION` and `ESCALATE_TO_USER` block the run. If `briefBeforeImplementation=false`, the harness still creates a one-off brief so the serious-task policy can be evaluated.
+
+Quality-impacting gates are frontier-owned: plan review, implementation review, and final review use `frontierModel` and `frontierThinking`. The legacy `local-review.md` artifact name is retained for resume compatibility, but it records a frontier implementation review.
+
+Reviewer prompts require test assertion-quality review, at least one adversarial probe, and reentry/idempotency checks for stateful work. Residual gaps block approval for public API, data integrity, authentication, payment, migration, or long-lived state changes.
 
 ## Safety and rollback
 

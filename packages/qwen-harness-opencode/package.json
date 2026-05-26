@@ -1,6 +1,6 @@
 {
   "name": "qwen-harness-opencode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "OpenCode skill and TUI sidebar for .qwen-harness status, progress, blockers, and token efficiency.",
   "scripts": {

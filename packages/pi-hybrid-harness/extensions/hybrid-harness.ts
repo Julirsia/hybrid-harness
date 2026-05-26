@@ -79,6 +79,8 @@ interface HarnessState {
 
 type SliceStatus = "pending" | "in_progress" | "done" | "blocked";
 type CriterionStatus = "pending" | "satisfied" | "failed" | "unknown";
+type EvidenceType = "unit" | "integration" | "e2e" | "manual" | "static" | "smoke";
+type PlanReviewVerdict = "READY" | "NEEDS_REVISION" | "ESCALATE_TO_USER";
 type TestFailureKind =
 	| "none"
 	| "compile_error"
@@ -108,6 +110,13 @@ interface HarnessProgress {
 		description: string;
 		status: CriterionStatus;
 		evidence: string[];
+		verificationContracts?: string[];
+		evidenceType?: EvidenceType;
+		sourceEvidence?: string[];
+		runtimeEvidence?: string[];
+		adversarialProbes?: string[];
+		reentryProbes?: string[];
+		residualGaps?: string[];
 	}>;
 	frontierRecheckTriggers: Array<{
 		id: string;
@@ -139,6 +148,14 @@ interface VerificationSummary {
 	allPassed: boolean;
 }
 
+interface ClaimEvidenceRow {
+	claim: string;
+	evidenceCommand: string;
+	evidenceType: EvidenceType;
+	whatWouldFailIfBroken: string;
+	residualGap: string;
+}
+
 interface PiRunResult {
 	ok: boolean;
 	exitCode: number;
@@ -164,6 +181,7 @@ type HybridRunStageId =
 	| "checkpoint"
 	| "design"
 	| "brief"
+	| "plan-review"
 	| "local-loop"
 	| "finish"
 	| "local-review"
@@ -296,6 +314,17 @@ interface OrchestrationBrief {
 	blockingQuestions: string[];
 	taskRisk: "low" | "medium" | "high";
 	recommendedAction: "proceed" | "ask_user" | "stop";
+}
+
+interface PlanReview {
+	planArchitectVerdict: PlanReviewVerdict;
+	planCriticVerdict: PlanReviewVerdict;
+	verdict: PlanReviewVerdict;
+	blockingIssues: string[];
+	requiredRevisions: string[];
+	reviewedValidationContracts: string[];
+	residualRisks: string[];
+	nextAction: string;
 }
 
 const HYBRID_RUN_MESSAGE_TYPE = "hybrid-run-result";
@@ -825,6 +854,22 @@ function artifactReady(
 	}
 }
 
+function parsePlanReviewChildOk(text: string): boolean | undefined {
+	const match = text.match(/-\s*ok:\s*(true|false)/i);
+	if (match?.[1]?.toLowerCase() === "true") return true;
+	if (match?.[1]?.toLowerCase() === "false") return false;
+	return undefined;
+}
+
+function planReviewArtifactReady(cwd: string, config: HarnessConfig): boolean {
+	const text = readArtifact(cwd, config, "plan-review.md");
+	return (
+		artifactReady(cwd, config, "plan-review.md") &&
+		parsePlanReviewVerdict(text) === "READY" &&
+		parsePlanReviewChildOk(text) === true
+	);
+}
+
 function hybridStageArtifactsReady(
 	cwd: string,
 	config: HarnessConfig,
@@ -838,6 +883,8 @@ function hybridStageArtifactsReady(
 		);
 	if (stage === "brief")
 		return artifactReady(cwd, config, "orchestration-brief.md");
+	if (stage === "plan-review")
+		return planReviewArtifactReady(cwd, config);
 	if (stage === "local-loop")
 		return (
 			artifactReady(cwd, config, "local-log.md") &&
@@ -846,6 +893,7 @@ function hybridStageArtifactsReady(
 	if (stage === "finish")
 		return (
 			artifactReady(cwd, config, "verification-summary.json") &&
+			artifactReady(cwd, config, "claim-evidence-matrix.md") &&
 			artifactReady(cwd, config, "progress.json")
 		);
 	if (stage === "local-review")
@@ -877,6 +925,7 @@ const HYBRID_STAGE_ORDER: HybridRunStageId[] = [
 	"checkpoint",
 	"design",
 	"brief",
+	"plan-review",
 	"local-loop",
 	"finish",
 	"local-review",
@@ -898,10 +947,15 @@ function hybridStageArtifactNames(stage: HybridRunStageId): string[] {
 	if (stage === "design")
 		return ["repo-map.md", "frontier-design.md", "implementation-plan.json"];
 	if (stage === "brief") return ["orchestration-brief.md"];
+	if (stage === "plan-review") return ["plan-review.md"];
 	if (stage === "local-loop")
 		return ["local-log.md", "test-evidence.md", "git-summary.md"];
 	if (stage === "finish")
-		return ["verification-summary.json", "verification-summary.md"];
+		return [
+			"verification-summary.json",
+			"verification-summary.md",
+			"claim-evidence-matrix.md",
+		];
 	if (stage === "local-review") return ["local-review.md"];
 	if (stage === "frontier-final") return ["final-review.md"];
 	if (stage === "summary") return ["run-summary.md", "usage-summary.md"];
@@ -1013,6 +1067,10 @@ function cleanRunArtifacts(cwd: string, config: HarnessConfig): void {
 		"progress.json",
 		"progress.md",
 		"test-evidence.md",
+		"claim-evidence-matrix.md",
+		"plan-review.md",
+		"requirements.md",
+		"design-grill.md",
 		"verification-summary.json",
 		"verification-summary.md",
 		"local-log.md",
@@ -1137,7 +1195,16 @@ function progressToMarkdown(progress: HarnessProgress): string {
 	);
 	const criteriaLines = progress.acceptanceCriteria.map(
 		(criterion) =>
-			`- [${criterion.status === "satisfied" ? "x" : " "}] ${criterion.id}: ${criterion.description} (${criterion.status})${criterion.evidence.length ? ` — ${criterion.evidence.join("; ")}` : ""}`,
+			[
+				`- [${criterion.status === "satisfied" ? "x" : " "}] ${criterion.id}: ${criterion.description} (${criterion.status})${criterion.evidence.length ? ` — ${criterion.evidence.join("; ")}` : ""}`,
+				`  - verification contracts: ${criterion.verificationContracts?.length ? criterion.verificationContracts.join("; ") : "none"}`,
+				`  - evidence type: ${criterion.evidenceType ?? "unspecified"}`,
+				`  - source evidence: ${criterion.sourceEvidence?.length ? criterion.sourceEvidence.join("; ") : "none"}`,
+				`  - runtime evidence: ${criterion.runtimeEvidence?.length ? criterion.runtimeEvidence.join("; ") : "none"}`,
+				`  - adversarial probes: ${criterion.adversarialProbes?.length ? criterion.adversarialProbes.join("; ") : "none"}`,
+				`  - reentry/idempotency probes: ${criterion.reentryProbes?.length ? criterion.reentryProbes.join("; ") : "none"}`,
+				`  - residual gaps: ${criterion.residualGaps?.length ? criterion.residualGaps.join("; ") : "none"}`,
+			].join("\n"),
 	);
 	const triggerLines = progress.frontierRecheckTriggers.map(
 		(trigger) =>
@@ -1195,6 +1262,15 @@ function fallbackProgress(task: string): HarnessProgress {
 				description: "Requested task is implemented without regressions",
 				status: "pending",
 				evidence: [],
+				verificationContracts: [
+					"Define a reproducible command, script, or manual procedure before accepting this criterion.",
+				],
+				evidenceType: "manual",
+				sourceEvidence: [],
+				runtimeEvidence: [],
+				adversarialProbes: [],
+				reentryProbes: [],
+				residualGaps: ["No executable verification contract has been extracted yet."],
 			},
 		],
 		frontierRecheckTriggers: [
@@ -1252,6 +1328,24 @@ function normalizeCriterionStatus(value: unknown): CriterionStatus {
 	}
 }
 
+function normalizeStringArray(value: unknown): string[] {
+	return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+}
+
+function normalizeEvidenceType(value: unknown): EvidenceType | undefined {
+	const normalized = String(value ?? "").toLowerCase();
+	if (
+		normalized === "unit" ||
+		normalized === "integration" ||
+		normalized === "e2e" ||
+		normalized === "manual" ||
+		normalized === "static" ||
+		normalized === "smoke"
+	)
+		return normalized;
+	return undefined;
+}
+
 function normalizeProgress(
 	raw: Partial<HarnessProgress> | undefined,
 	task: string,
@@ -1286,7 +1380,16 @@ function normalizeProgress(
 							c.description || `Acceptance criterion ${i + 1}`,
 						),
 						status: normalizeCriterionStatus(c.status),
-						evidence: Array.isArray(c.evidence) ? c.evidence.map(String) : [],
+						evidence: normalizeStringArray(c.evidence),
+						verificationContracts: normalizeStringArray(
+							c.verificationContracts,
+						),
+						evidenceType: normalizeEvidenceType(c.evidenceType),
+						sourceEvidence: normalizeStringArray(c.sourceEvidence),
+						runtimeEvidence: normalizeStringArray(c.runtimeEvidence),
+						adversarialProbes: normalizeStringArray(c.adversarialProbes),
+						reentryProbes: normalizeStringArray(c.reentryProbes),
+						residualGaps: normalizeStringArray(c.residualGaps),
 					}))
 				: fallback.acceptanceCriteria,
 		frontierRecheckTriggers:
@@ -1424,6 +1527,63 @@ function verificationCommands(cwd: string, config: HarnessConfig): string[] {
 	return inferVerificationCommands(cwd);
 }
 
+function claimEvidenceRows(
+	progress: HarnessProgress,
+	summary: VerificationSummary,
+): ClaimEvidenceRow[] {
+	const passedCommands = summary.commands
+		.filter((command) => command.ok)
+		.map((command) => command.command);
+	return progress.acceptanceCriteria.map((criterion) => {
+		const evidenceCommand =
+			criterion.verificationContracts?.[0] ??
+			passedCommands[0] ??
+			"No executable verification contract recorded";
+		const evidenceType =
+			criterion.evidenceType ??
+			(criterion.runtimeEvidence?.length ? "integration" : "static");
+		const residualGap =
+			criterion.residualGaps?.join("; ") ||
+			(criterion.status === "satisfied"
+				? "none recorded"
+				: "criterion is not satisfied");
+		return {
+			claim: `${criterion.id}: ${criterion.description}`,
+			evidenceCommand,
+			evidenceType,
+			whatWouldFailIfBroken:
+				criterion.runtimeEvidence?.[0] ??
+				criterion.sourceEvidence?.[0] ??
+				criterion.evidence[0] ??
+				"missing evidence would leave this claim unsupported",
+			residualGap,
+		};
+	});
+}
+
+function claimEvidenceMatrixMarkdown(
+	progress: HarnessProgress,
+	summary: VerificationSummary,
+): string {
+	const rows = claimEvidenceRows(progress, summary);
+	const escapeCell = (value: string) => value.replace(/\|/g, "\\|").trim();
+	return [
+		"# Claim-Evidence Matrix",
+		"",
+		"| Claim | Evidence command | Evidence type | What would fail if broken | Residual gap |",
+		"| --- | --- | --- | --- | --- |",
+		...(rows.length
+			? rows.map(
+					(row) =>
+						`| ${escapeCell(row.claim)} | ${escapeCell(row.evidenceCommand)} | ${row.evidenceType} | ${escapeCell(row.whatWouldFailIfBroken)} | ${escapeCell(row.residualGap)} |`,
+				)
+			: ["| none | none | static | no acceptance criteria recorded | none |"]),
+		"",
+		"Source-level evidence is not runtime evidence; behavioral claims need runtime, unit, integration, e2e, or manual proof.",
+		"Smoke evidence cannot satisfy behavioral acceptance criteria without behavioral proof.",
+	].join("\n");
+}
+
 function verificationSummaryMarkdown(summary: VerificationSummary): string {
 	const lines = [
 		"# Verification Summary",
@@ -1453,6 +1613,7 @@ function runVerificationSummary(
 	notify?: Notify,
 ): VerificationSummary {
 	const commands = verificationCommands(cwd, config);
+	const progress = readProgress(cwd, config, state.task ?? "(task missing)");
 	const results: VerificationSummary["commands"] = [];
 	const evidenceLines = [
 		readArtifact(cwd, config, "test-evidence.md") ||
@@ -1512,6 +1673,16 @@ function runVerificationSummary(
 		state,
 		"verification-summary.md",
 		verificationSummaryMarkdown(summary),
+	);
+	const matrixColumnContract =
+		"Evidence type | What would fail if broken | Residual gap";
+	const matrixMarkdown = `${claimEvidenceMatrixMarkdown(progress, summary)}\n\nMatrix columns: ${matrixColumnContract}\n`;
+	writeArtifact(
+		cwd,
+		config,
+		state,
+		"claim-evidence-matrix.md",
+		matrixMarkdown,
 	);
 	if (results.length > 0) {
 		writeArtifact(cwd, config, state, "test-evidence.md", evidenceLines.join("\n"));
@@ -2291,7 +2462,7 @@ function usageSummaryMarkdown(cwd: string, config: HarnessConfig): string {
 		{ name: "repo-map.md", bucket: "local" },
 		{ name: "frontier-design.md", bucket: "frontier" },
 		{ name: "local-log.md", bucket: "local" },
-		{ name: "local-review.md", bucket: "local" },
+		{ name: "local-review.md", bucket: "frontier" },
 		{ name: "final-review.md", bucket: "frontier" },
 	] as const;
 	const totals = {
@@ -2475,6 +2646,9 @@ function localWorkerPrompt(
 		"- Make surgical, minimal changes.",
 		"- Prefer existing project conventions.",
 		"- Run relevant tests or checks. If no test command is configured, infer the smallest safe verification command.",
+		"- smoke evidence cannot satisfy behavioral acceptance criteria; build passed, HTTP 200, server responds, and import succeeds are baseline only.",
+		"- Before starting the next slice, re-check at least one critical claim from the previous completed slice before relying on it.",
+		"- Cover more than the happy path: normal path, invalid input, boundary values, resource limits, state reentry, and restart/retry/idempotency when applicable.",
 		"- If blocked, write a clear blocker report instead of inventing broad rewrites.",
 		"- Do not modify .pi-harness except when explicitly asked.",
 		"",
@@ -2497,8 +2671,9 @@ function localWorkerPrompt(
 		...interactiveValidationGuidance(task, config),
 		"Implement the next necessary slice, verify it, then summarize:",
 		"1. Files changed",
-		"2. Verification commands and results",
-		"3. Remaining work or blockers",
+		"2. Verification commands and results, including source evidence vs runtime evidence",
+		"3. Any adversarial probe or reentry/idempotency probe run",
+		"4. Remaining work or blockers",
 	].join("\n");
 }
 
@@ -2553,9 +2728,10 @@ function createHybridRunDetails(
 			label: "Orchestration briefing / clarification gate",
 			status: "pending",
 		},
+		{ id: "plan-review", label: "Serious task plan validation", status: "pending" },
 		{ id: "local-loop", label: "Local worker/test loops", status: "pending" },
 		{ id: "finish", label: "Deterministic finish/reconcile", status: "pending" },
-		{ id: "local-review", label: "Local reviewer", status: "pending" },
+		{ id: "local-review", label: "Frontier implementation review", status: "pending" },
 		{ id: "frontier-final", label: "Frontier final gate", status: "pending" },
 		{ id: "summary", label: "Artifact summary", status: "pending" },
 	];
@@ -3588,13 +3764,13 @@ const HYBRID_MODEL_CONFIG_KEYS: Array<{
 	},
 	{
 		key: "localReviewerModel",
-		label: "Local reviewer",
-		description: "Local review, repair checks, and final local review",
+		label: "Local control reviewer",
+		description: "Local progress extraction, repair checks, and bookkeeping",
 	},
 	{
 		key: "frontierModel",
 		label: "Frontier",
-		description: "Design and final approval gate",
+		description: "Design, plan review, implementation review, and final approval gates",
 	},
 ];
 
@@ -4318,6 +4494,37 @@ function briefToMarkdown(brief: OrchestrationBrief): string {
 	].join("\n");
 }
 
+function readOrchestrationBriefArtifact(
+	cwd: string,
+	config: HarnessConfig,
+): OrchestrationBrief | undefined {
+	const text = readArtifact(cwd, config, "orchestration-brief.md");
+	if (!text.trim()) return undefined;
+	const taskRisk = text.match(/-\s*Risk:\s*(low|medium|high)/i)?.[1];
+	const recommendedAction = text.match(
+		/-\s*Recommended action:\s*(proceed|ask_user|stop)/i,
+	)?.[1];
+	const planSummary =
+		text.match(/## Plan summary\s+([\s\S]*?)(?:\n## |\n---|$)/i)?.[1]?.trim() ||
+		"Reusing existing orchestration brief.";
+	const blockingBlock = text.match(
+		/## Blocking questions\s+([\s\S]*?)(?:\n## |\n---|$)/i,
+	)?.[1];
+	const blockingQuestions = blockingBlock
+		? blockingBlock
+				.split("\n")
+				.map((line) => line.replace(/^-\s*/, "").trim())
+				.filter((line) => line && line !== "none")
+		: [];
+	return normalizeBrief({
+		planSummary,
+		taskRisk: taskRisk as OrchestrationBrief["taskRisk"] | undefined,
+		recommendedAction:
+			recommendedAction as OrchestrationBrief["recommendedAction"] | undefined,
+		blockingQuestions,
+	});
+}
+
 async function createOrchestrationBrief(
 	cwd: string,
 	config: HarnessConfig,
@@ -4370,6 +4577,184 @@ async function createOrchestrationBrief(
 	return brief;
 }
 
+function normalizePlanReviewVerdict(value: unknown): PlanReviewVerdict {
+	if (value === "READY") return "READY";
+	if (value === "NEEDS_REVISION") return "NEEDS_REVISION";
+	if (value === "ESCALATE_TO_USER") return "ESCALATE_TO_USER";
+	const normalized = String(value ?? "").toUpperCase();
+	if (normalized === "READY") return "READY";
+	if (normalized === "NEEDS_REVISION") return "NEEDS_REVISION";
+	if (normalized === "ESCALATE_TO_USER") return "ESCALATE_TO_USER";
+	return "NEEDS_REVISION";
+}
+
+function normalizePlanReview(value: Partial<PlanReview> | undefined): PlanReview {
+	const planArchitectVerdict = normalizePlanReviewVerdict(
+		value?.planArchitectVerdict,
+	);
+	const planCriticVerdict = normalizePlanReviewVerdict(value?.planCriticVerdict);
+	let verdict = normalizePlanReviewVerdict(value?.verdict);
+	if (
+		planArchitectVerdict === "ESCALATE_TO_USER" ||
+		planCriticVerdict === "ESCALATE_TO_USER" ||
+		verdict === "ESCALATE_TO_USER"
+	) {
+		verdict = "ESCALATE_TO_USER";
+	} else if (
+		planArchitectVerdict !== "READY" ||
+		planCriticVerdict !== "READY" ||
+		verdict !== "READY"
+	) {
+		verdict = "NEEDS_REVISION";
+	}
+	return {
+		planArchitectVerdict,
+		planCriticVerdict,
+		verdict,
+		blockingIssues: normalizeStringArray(value?.blockingIssues),
+		requiredRevisions: normalizeStringArray(value?.requiredRevisions),
+		reviewedValidationContracts: normalizeStringArray(
+			value?.reviewedValidationContracts,
+		),
+		residualRisks: normalizeStringArray(value?.residualRisks),
+		nextAction: String(
+			value?.nextAction ||
+				(verdict === "READY"
+					? "Proceed to local implementation."
+					: "Revise the plan review output."),
+		),
+	};
+}
+
+function planReviewToMarkdown(review: PlanReview, result: PiRunResult): string {
+	const section = (title: string, items: string[]) => [
+		`## ${title}`,
+		"",
+		...(items.length ? items.map((item) => `- ${item}`) : ["- none"]),
+		"",
+	];
+	return [
+		"# Hybrid Plan Review",
+		"",
+		`- Verdict: ${review.verdict}`,
+		`- plan_architect: ${review.planArchitectVerdict}`,
+		`- plan_critic: ${review.planCriticVerdict}`,
+		`- Next action: ${review.nextAction}`,
+		"",
+		"```json",
+		JSON.stringify(review, null, "\t"),
+		"```",
+		"",
+		...section("Blocking issues", review.blockingIssues),
+		...section("Required revisions", review.requiredRevisions),
+		...section(
+			"Reviewed validation contracts",
+			review.reviewedValidationContracts,
+		),
+		...section("Residual risks", review.residualRisks),
+		"## Raw run metadata",
+		"",
+		`- ok: ${result.ok}`,
+		`- exitCode: ${result.exitCode}`,
+		`- usage: ${formatUsage(result)}`,
+		"",
+		"```stderr",
+		truncateMiddle(result.stderr, 4000),
+		"```",
+		"",
+		"```text",
+		truncateMiddle(result.text, 20_000),
+		"```",
+	].join("\n");
+}
+
+function seriousTaskPolicyApplies(brief: OrchestrationBrief): boolean {
+	return brief.taskRisk === "medium" || brief.taskRisk === "high";
+}
+
+function parsePlanReviewVerdict(text: string): PlanReviewVerdict {
+	return normalizePlanReview(
+		extractJsonObject<Partial<PlanReview>>(text),
+	).verdict;
+}
+
+async function runPlanReview(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	task: string,
+	brief: OrchestrationBrief,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<{ review: PlanReview; result: PiRunResult }> {
+	notify?.("Hybrid plan review: validating serious-task execution plan...", "info");
+	const progress = readProgress(cwd, config, task);
+	const prompt = [
+		"You are the FRONTIER PLAN REVIEWER for a hybrid coding harness.",
+		"This gate is CWS-compatible and not CWS-dependent: use the rubric names below, but do not assume Codex native subagents exist.",
+		"Do not modify files. Decide whether local implementation may start.",
+		"",
+		`Task: ${task}`,
+		"",
+		"Read these artifacts and compare them against the current progress snapshot:",
+		`- ${config.stateDir}/frontier-design.md`,
+		`- ${config.stateDir}/implementation-plan.json`,
+		`- ${config.stateDir}/orchestration-brief.md`,
+		`- ${config.stateDir}/repo-map.md`,
+		`- ${config.stateDir}/progress.json`,
+		`- ${config.stateDir}/progress.md`,
+		"",
+		"Orchestration brief:",
+		"```json",
+		JSON.stringify(brief, null, 2),
+		"```",
+		"",
+		"Current progress snapshot:",
+		"```json",
+		JSON.stringify(progress, null, 2),
+		"```",
+		"",
+		"plan_architect rubric:",
+		"- Check architecture fit, boundaries, simpler alternatives, compatibility, scope, rollback/retry impact, and stage ordering.",
+		"- Confirm validation contracts preserve sourceEvidence and runtimeEvidence rather than downgrading runtime proof to source presence.",
+		"",
+		"plan_critic rubric:",
+		"- Check executable acceptance criteria, file ownership, verification commands, hard stops, stage sequencing, and whether implementation can proceed without guessing.",
+		"- Block if the plan relies on smoke evidence for behavioral acceptance criteria, lacks a counterexample probe, lacks state reentry/idempotency checks where relevant, or has missing verificationContracts.",
+		"",
+		"Return only JSON with this exact shape:",
+		`{"planArchitectVerdict":"READY|NEEDS_REVISION|ESCALATE_TO_USER","planCriticVerdict":"READY|NEEDS_REVISION|ESCALATE_TO_USER","verdict":"READY|NEEDS_REVISION|ESCALATE_TO_USER","blockingIssues":["..."],"requiredRevisions":["..."],"reviewedValidationContracts":["..."],"residualRisks":["..."],"nextAction":"..."}`,
+		"",
+		"Rules:",
+		"- Only READY for both plan_architect and plan_critic plus final verdict allows local implementation.",
+		"- Any NEEDS_REVISION blocks implementation.",
+		"- Any ESCALATE_TO_USER blocks implementation and asks for user decision.",
+		"- reviewedValidationContracts must name which verificationContracts, sourceEvidence, runtimeEvidence, adversarialProbes, and reentryProbes were reviewed.",
+	].join("\n");
+	const result = await runPiOnce({
+		cwd,
+		model: config.frontierModel,
+		thinking: config.frontierThinking,
+		prompt,
+		tools: ["read", "grep", "find", "ls"],
+		timeoutMs: 10 * 60_000,
+		liveLabel: "plan-review",
+		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+		onLog: liveLog,
+	});
+	const review = normalizePlanReview(
+		extractJsonObject<Partial<PlanReview>>(result.text),
+	);
+	writeArtifact(
+		cwd,
+		config,
+		state,
+		"plan-review.md",
+		planReviewToMarkdown(review, result),
+	);
+	return { review, result };
+}
+
 async function createProgressFromDesign(
 	cwd: string,
 	config: HarnessConfig,
@@ -4396,11 +4781,14 @@ async function createProgressFromDesign(
 		`- ${config.stateDir}/repo-map.md`,
 		"",
 		"Return only JSON with this exact shape:",
-		`{\n  "version": 1,\n  "task": "...",\n  "currentSliceId": "S1",\n  "slices": [{"id":"S1","title":"...","status":"pending","evidence":[],"remaining":["..."]}],\n  "acceptanceCriteria": [{"id":"AC1","description":"...","status":"pending","evidence":[]}],\n  "frontierRecheckTriggers": [{"id":"FR1","description":"...","active":false,"evidence":""}],\n  "testObservations": [],\n  "blockers": [],\n  "nextAction": "..."\n}`,
+		`{\n  "version": 1,\n  "task": "...",\n  "currentSliceId": "S1",\n  "slices": [{"id":"S1","title":"...","status":"pending","evidence":[],"remaining":["..."]}],\n  "acceptanceCriteria": [{"id":"AC1","description":"...","status":"pending","evidence":[],"verificationContracts":["sample input + command/script/manual procedure + expected output/diff"],"evidenceType":"unit|integration|e2e|manual|static|smoke","sourceEvidence":[],"runtimeEvidence":[],"adversarialProbes":[],"reentryProbes":[],"residualGaps":[]}],\n  "frontierRecheckTriggers": [{"id":"FR1","description":"...","active":false,"evidence":""}],\n  "testObservations": [],\n  "blockers": [],\n  "nextAction": "..."\n}`,
 		"",
 		"Guidance:",
 		"- Slices must be small, sequential, and verifiable.",
-		"- Acceptance criteria must be concrete and testable.",
+		"- Acceptance criteria must be concrete and testable with executable verification contracts.",
+		"- Track source evidence separately from runtime evidence; source-level evidence is not runtime evidence.",
+		"- Mark smoke evidence as smoke only; smoke evidence cannot satisfy behavioral acceptance criteria.",
+		"- Include at least one adversarial probe and a reentry/idempotency probe when state, retries, resume, or persistence are involved.",
 		"- Frontier re-check triggers are conditions where local implementation must not silently continue, e.g. design contradiction, public API change, security/auth change, data migration, or impossible acceptance criteria.",
 	].join("\n");
 	const result = await runPiOnce({
@@ -4485,6 +4873,9 @@ async function updateProgressAfterIteration(
 		"Assessment rules:",
 		"- Mark a slice done only when changed files and verification evidence support it.",
 		"- Mark acceptance criteria satisfied only with explicit evidence.",
+		"- Preserve verificationContracts, evidenceType, sourceEvidence, runtimeEvidence, adversarialProbes, reentryProbes, and residualGaps for every acceptance criterion.",
+		"- Do not treat source-level evidence as runtime evidence.",
+		"- smoke evidence cannot satisfy behavioral acceptance criteria; build passed, HTTP 200, server responds, and import succeeds are baseline only.",
 		interactivePolicy
 			? "- STRICT INTERACTIVE POLICY ACTIVE: for browser/UI/gameplay/runtime tasks, do not mark runtime acceptance criteria satisfied from syntax checks, HTTP 200 checks, screenshots without assertions, or worker self-reports. Require a configured passing deterministic test command or objective runtime assertions recorded as test evidence. If missing, keep relevant criteria pending/failed and add a blocker."
 			: "- Runtime validation policy: not active for this task.",
@@ -4540,6 +4931,9 @@ function syncHarnessArtifacts(
 		"repo-map.md",
 		"frontier-design.md",
 		"orchestration-brief.md",
+		"plan-review.md",
+		"requirements.md",
+		"design-grill.md",
 		"user-clarifications.md",
 		"steering.jsonl",
 		"implementation-plan.json",
@@ -4665,6 +5059,183 @@ function finishHybridArtifacts(
 	return { summary, progress };
 }
 
+async function runFrontierInterview(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	input: string,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<PiRunResult> {
+	const requestOrAnswer = input.trim();
+	const task =
+		state.task ||
+		readArtifact(cwd, config, "task.md").trim() ||
+		requestOrAnswer ||
+		"(task missing)";
+	if (!state.task && requestOrAnswer) state.task = requestOrAnswer;
+	const steering = hybridSteeringMarkdown(cwd, config);
+	if (steering) markHybridSteeringConsumed(cwd, config, "frontier-interview");
+	notify?.("Hybrid interview: frontier requirements gate running...", "info");
+	const prompt = [
+		"You are the FRONTIER REQUIREMENTS INTERVIEWER for a hybrid coding harness.",
+		"The frontier owns design/requirements judgment. local/Qwen may provide repo facts, but must not implement during this command.",
+		"You must not implement, edit files, or start coding. Produce requirements clarity only.",
+		"",
+		`Task: ${task}`,
+		`Latest user request or answer: ${requestOrAnswer || "(none provided)"}`,
+		...(steering ? ["", steering] : []),
+		"",
+		"Existing artifacts to consider if present:",
+		`- ${config.stateDir}/task.md`,
+		`- ${config.stateDir}/requirements.md`,
+		`- ${config.stateDir}/design-grill.md`,
+		`- ${config.stateDir}/repo-map.md`,
+		`- ${config.stateDir}/orchestration-brief.md`,
+		`- ${config.stateDir}/frontier-design.md`,
+		`- ${config.stateDir}/user-clarifications.md`,
+		"",
+		"Current requirements artifact:",
+		"```markdown",
+		truncateMiddle(readArtifact(cwd, config, "requirements.md"), 20_000),
+		"```",
+		"",
+		"Rules:",
+		"- If requirements are not ready, ask exactly one next question and include a recommended answer or 2-3 concrete choices.",
+		"- If requirements are ready, produce an implementation-ready handoff.",
+		"- The handoff must include Source Request, Desired Outcome, In Scope, Non-Goals, Decision Boundaries, Acceptance Criteria, Verification Contracts, Constraints, Assumptions, Open Questions, Likely Touchpoints, and Stop Conditions.",
+		"- Acceptance Criteria must be executable or paired with an explicit manual procedure.",
+		"- Do not assign implementation to Qwen until this gate is ready.",
+	].join("\n");
+	const result = await runPiOnce({
+		cwd,
+		model: config.frontierModel,
+		thinking: config.frontierThinking,
+		prompt,
+		tools: ["read", "grep", "find", "ls"],
+		timeoutMs: 15 * 60_000,
+		liveLabel: "frontier-interview",
+		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+		onLog: liveLog,
+	});
+	writeArtifact(
+		cwd,
+		config,
+		state,
+		"requirements.md",
+		[
+			"# Frontier Requirements Interview",
+			"",
+			`- model: ${config.frontierModel}`,
+			`- thinking: ${config.frontierThinking}`,
+			`- ok: ${result.ok}`,
+			`- exitCode: ${result.exitCode}`,
+			`- usage: ${formatUsage(result)}`,
+			"",
+			result.text || "(no output)",
+			"",
+			"## stderr",
+			"",
+			"```stderr",
+			truncateMiddle(result.stderr, 4000),
+			"```",
+		].join("\n"),
+	);
+	state.frontierModel = config.frontierModel;
+	state.frontierThinking = config.frontierThinking;
+	state.lastRun = nowIso();
+	saveState(cwd, config, state);
+	return result;
+}
+
+async function runFrontierGrill(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	input: string,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<PiRunResult> {
+	const planOrDesign = input.trim();
+	const task =
+		state.task ||
+		readArtifact(cwd, config, "task.md").trim() ||
+		planOrDesign ||
+		"(task missing)";
+	if (!state.task && planOrDesign) state.task = planOrDesign;
+	const steering = hybridSteeringMarkdown(cwd, config);
+	if (steering) markHybridSteeringConsumed(cwd, config, "frontier-grill");
+	notify?.("Hybrid grill: frontier design stress test running...", "info");
+	const prompt = [
+		"You are the FRONTIER DESIGN GRILL for a hybrid coding harness.",
+		"The frontier owns design/requirements judgment. local/Qwen may provide repo facts, but must not implement during this command.",
+		"You must not implement, edit files, or start coding. Stress-test the design only.",
+		"",
+		`Task: ${task}`,
+		`Latest plan or design text: ${planOrDesign || "(none provided)"}`,
+		...(steering ? ["", steering] : []),
+		"",
+		"Existing artifacts to consider if present:",
+		`- ${config.stateDir}/requirements.md`,
+		`- ${config.stateDir}/design-grill.md`,
+		`- ${config.stateDir}/frontier-design.md`,
+		`- ${config.stateDir}/orchestration-brief.md`,
+		`- ${config.stateDir}/repo-map.md`,
+		`- ${config.stateDir}/progress.md`,
+		"",
+		"Requirements artifact:",
+		"```markdown",
+		truncateMiddle(readArtifact(cwd, config, "requirements.md"), 20_000),
+		"```",
+		"",
+		"Rules:",
+		"- Grill broad product, architecture, workflow, and domain decisions before implementation.",
+		"- Cover design branches, rejected alternatives, failure modes, compatibility, rollout, rollback, state ownership, data integrity, and user-visible behavior.",
+		"- If a blocking decision remains unresolved, ask exactly one next question and include a recommended answer.",
+		"- If the design is ready, return a concise verdict, required revisions if any, accepted design, rejected alternatives, failure modes, verification implications, and handoff notes for later Qwen implementation.",
+		"- Do not let local/Qwen implementation start from an unresolved design branch.",
+	].join("\n");
+	const result = await runPiOnce({
+		cwd,
+		model: config.frontierModel,
+		thinking: config.frontierThinking,
+		prompt,
+		tools: ["read", "grep", "find", "ls"],
+		timeoutMs: 15 * 60_000,
+		liveLabel: "frontier-grill",
+		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+		onLog: liveLog,
+	});
+	writeArtifact(
+		cwd,
+		config,
+		state,
+		"design-grill.md",
+		[
+			"# Frontier Design Grill",
+			"",
+			`- model: ${config.frontierModel}`,
+			`- thinking: ${config.frontierThinking}`,
+			`- ok: ${result.ok}`,
+			`- exitCode: ${result.exitCode}`,
+			`- usage: ${formatUsage(result)}`,
+			"",
+			result.text || "(no output)",
+			"",
+			"## stderr",
+			"",
+			"```stderr",
+			truncateMiddle(result.stderr, 4000),
+			"```",
+		].join("\n"),
+	);
+	state.frontierModel = config.frontierModel;
+	state.frontierThinking = config.frontierThinking;
+	state.lastRun = nowIso();
+	saveState(cwd, config, state);
+	return result;
+}
+
 async function runHybridStart(
 	cwd: string,
 	config: HarnessConfig,
@@ -4747,6 +5318,12 @@ async function runHybridStart(
 		"6. Verification commands",
 		"7. Risks and frontier re-check triggers",
 		"8. Local worker prompt notes",
+		"",
+		"Verification design requirements:",
+		"- Each acceptance criterion needs an executable verification contract: sample input, command/script/manual procedure, and expected output or diff.",
+		"- Separate source evidence from runtime evidence.",
+		"- Identify at least one adversarial probe and any state reentry/idempotency probe needed.",
+		"- Treat build passed, HTTP 200, server responds, import succeeds, and smoke checks as baseline only.",
 	].join("\n");
 	const architect = await runPiOnce({
 		cwd,
@@ -4940,7 +5517,7 @@ async function runLocalReview(
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "local-review");
 	const prompt = [
-		"You are the LOCAL REVIEWER in a hybrid coding harness.",
+		"You are the FRONTIER IMPLEMENTATION REVIEWER in a hybrid coding harness.",
 		"Review the implementation against the frontier design. You are read-only. Do not modify files.",
 		"Be strict about test evidence, regressions, edge cases, and design drift.",
 		"",
@@ -4951,24 +5528,33 @@ async function runLocalReview(
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
 		`- ${config.stateDir}/test-evidence.md`,
+		`- ${config.stateDir}/claim-evidence-matrix.md`,
 		`- ${config.stateDir}/verification-summary.json`,
 		`- ${config.stateDir}/local-log.md`,
 		`- ${config.stateDir}/git-summary.md`,
 		"",
 		"Output a fenced JSON object first, then optional markdown details. JSON schema:",
-		`{"verdict":"PASS|PASS_WITH_CONCERNS|FAIL","blockingIssues":["..."],"nonBlockingConcerns":["..."],"missingEvidence":["..."],"nextAction":"..."}`,
+		`{"verdict":"PASS|PASS_WITH_CONCERNS|FAIL","implementationClaims":["..."],"claimEvidenceMatrix":[{"claim":"...","evidenceCommand":"...","evidenceType":"unit|integration|e2e|manual|static|smoke","whatWouldFailIfBroken":"...","residualGap":"..."}],"testAssertionQuality":"...","independentAdversarialProbe":"...","highRiskResidualBlockers":["..."],"blockingIssues":["..."],"nonBlockingConcerns":["..."],"missingEvidence":["..."],"nextAction":"..."}`,
 		"Verdict meanings:",
 		"- PASS: implementation satisfies the design and evidence is adequate.",
 		"- PASS_WITH_CONCERNS: no known blocker, but evidence/risk remains.",
 		"- FAIL: local repair is required before final approval.",
+		"Evidence rules:",
+		"- Extract implementationClaims from the worker output, diff, and changed files.",
+		"- For every claim, require evidence in the claimEvidenceMatrix.",
+		"- source-level evidence is not runtime evidence; source-only proof cannot satisfy behavioral claims.",
+		"- Review testAssertionQuality: assertions must check postconditions, avoid shortcut mocks, and avoid bypassing the real user/API path.",
+		"- Run or specify an independentAdversarialProbe such as a minimum one counterexample, edge case, alternate call order, invalid input, or retry path.",
+		"- For public API, data integrity, authentication, payment, migration, or long-lived state, residual gaps must be highRiskResidualBlockers and force FAIL.",
 		interactivePolicy
 			? "Strict interactive/runtime policy is ACTIVE: if there is no passing configured deterministic test command or equivalent objective runtime assertion in test-evidence.md, you MUST return FAIL. Do not accept syntax checks, HTTP 200 checks, screenshots without assertions, or worker self-reported smoke tests as sufficient for browser/UI/game/gameplay behavior."
 			: "Strict interactive/runtime policy is not active for this task.",
 	].join("\n");
-	notify?.("Hybrid local reviewer running...", "info");
+	notify?.("Hybrid frontier implementation reviewer running...", "info");
 	const review = await runPiOnce({
 		cwd,
-		model: config.localReviewerModel,
+		model: config.frontierModel,
+		thinking: config.frontierThinking,
 		prompt,
 		tools: ["read", "grep", "find", "ls", "bash"],
 		timeoutMs: 20 * 60_000,
@@ -4985,7 +5571,7 @@ async function runLocalReview(
 		config,
 		state,
 		"local-review.md",
-		`# Local Review\n\n${review.text || "(no output)"}${policyOverride}\n\n---\n\n- ok: ${review.ok}\n- exitCode: ${review.exitCode}\n- usage: ${formatUsage(review)}\n\n\`\`\`stderr\n${truncateMiddle(review.stderr, 4000)}\n\`\`\`\n`,
+		`# Frontier Implementation Review\n\n${review.text || "(no output)"}${policyOverride}\n\n---\n\n- ok: ${review.ok}\n- exitCode: ${review.exitCode}\n- usage: ${formatUsage(review)}\n\n\`\`\`stderr\n${truncateMiddle(review.stderr, 4000)}\n\`\`\`\n`,
 	);
 	state.phase = "local-reviewed";
 	state.lastRun = nowIso();
@@ -5031,6 +5617,9 @@ async function runFrontierFinal(
 		"## Test evidence",
 		truncateMiddle(readArtifact(cwd, config, "test-evidence.md"), 30_000),
 		"",
+		"## Claim-evidence matrix",
+		truncateMiddle(readArtifact(cwd, config, "claim-evidence-matrix.md"), 20_000),
+		"",
 		"## Structured verification summary",
 		truncateMiddle(readArtifact(cwd, config, "verification-summary.json"), 20_000),
 		"",
@@ -5050,13 +5639,18 @@ async function runFrontierFinal(
 		truncateMiddle(git, 80_000),
 		"",
 		"Output a fenced JSON object first, then optional markdown details. JSON schema:",
-		`{"verdict":"APPROVE|REQUEST_CHANGES|ESCALATE_TO_USER","blockingIssues":["..."],"requiredFixes":["..."],"testEvidenceAssessment":"...","residualRisks":["..."],"anotherFrontierPassNecessary":false}`,
+		`{"verdict":"APPROVE|REQUEST_CHANGES|ESCALATE_TO_USER","claimEvidenceMatrix":[{"claim":"...","evidenceCommand":"...","evidenceType":"unit|integration|e2e|manual|static|smoke","whatWouldFailIfBroken":"...","residualGap":"..."}],"blockingIssues":["..."],"requiredFixes":["..."],"testEvidenceAssessment":"...","testAssertionQuality":"...","independentAdversarialProbe":"...","stateReentryIdempotencyAssessment":"...","highRiskResidualBlockers":["..."],"residualRisks":["..."],"anotherFrontierPassNecessary":false}`,
 		"Verdict meanings:",
 		"- APPROVE: changes are acceptable to ship/commit.",
 		"- REQUEST_CHANGES: local worker should fix concrete issues.",
 		"- ESCALATE_TO_USER: requirement/design ambiguity or risk requires user decision.",
 		"Final-gate evidence rules:",
 		"- For EACH acceptance criterion, map it to concrete evidence from test-evidence.md, local-log.md command output, or git diff. If any acceptance criterion lacks evidence, REQUEST_CHANGES.",
+		"- Review the claimEvidenceMatrix columns: Claim, Evidence command, Evidence type, What would fail if broken, Residual gap.",
+		"- Require minimum one counterexample or edge-case probe that is independent of the implementer's happy path.",
+		"- Require state reentry/idempotency assessment for stateful, resumable, retry, restart, or persistence behavior.",
+		"- Residual gaps are approval blockers for public API, data integrity, authentication, payment, migration, or long-lived state.",
+		"- Build passed, HTTP 200, server responds, import succeeds, and smoke checks are baseline only; smoke evidence cannot satisfy behavioral acceptance criteria.",
 		interactivePolicy
 			? "- STRICT INTERACTIVE POLICY ACTIVE: this is a browser/UI/gameplay/runtime task. APPROVE is forbidden unless there is a passing configured deterministic test command or objective runtime assertions in test-evidence.md. Syntax checks, HTTP 200 checks, screenshots without assertions, and worker self-reported smoke-test summaries are not sufficient."
 			: "- Strict interactive/runtime policy is not active for this task.",
@@ -5276,6 +5870,7 @@ async function runHybridOrchestration(options: {
 			reporter.setProgress(readProgress(options.cwd, config, task));
 		}
 
+		let brief: OrchestrationBrief | undefined;
 		if (config.briefBeforeImplementation) {
 			if (shouldSkipHybridStage(options.cwd, config, runState, "brief")) {
 				summary.push(
@@ -5293,6 +5888,7 @@ async function runHybridOrchestration(options: {
 					"brief",
 					"skipped",
 				);
+				brief = readOrchestrationBriefArtifact(options.cwd, config);
 			} else {
 				reporter.stage(
 					"brief",
@@ -5307,7 +5903,7 @@ async function runHybridOrchestration(options: {
 					"brief",
 					"running",
 				);
-				const brief = await createOrchestrationBrief(
+				brief = await createOrchestrationBrief(
 					options.cwd,
 					config,
 					state,
@@ -5405,6 +6001,168 @@ async function runHybridOrchestration(options: {
 				"brief",
 				"skipped",
 			);
+		}
+
+		if (
+			!explicitTask &&
+			shouldSkipHybridStage(options.cwd, config, runState, "plan-review")
+		) {
+			const planReviewVerdict = parsePlanReviewVerdict(
+				readArtifact(options.cwd, config, "plan-review.md"),
+			);
+			summary.push(
+				"## Plan review",
+				"",
+				`- Reusing existing plan-review.md. Verdict: ${planReviewVerdict}`,
+				"",
+			);
+			reporter.stage(
+				"plan-review",
+				"skipped",
+				`Reusing plan-review.md verdict=${planReviewVerdict}`,
+			);
+			markHybridRunStage(
+				options.cwd,
+				config,
+				state,
+				runState,
+				"plan-review",
+				"skipped",
+			);
+			if (planReviewVerdict !== "READY") {
+				throw new Error(
+					"Hybrid plan review blocked implementation. See .pi-harness/plan-review.md",
+				);
+			}
+		} else {
+			if (!brief) {
+				notify?.(
+					config.briefBeforeImplementation
+						? "Plan review needs orchestration brief; regenerating risk summary from artifacts."
+						: "Plan review needs orchestration brief even when briefBeforeImplementation=false.",
+					"info",
+				);
+				reporter.stage(
+					"brief",
+					"running",
+					config.briefBeforeImplementation
+						? "Regenerating risk summary for plan review"
+						: "briefBeforeImplementation=false; creating one-off risk brief for plan review",
+				);
+				brief = await createOrchestrationBrief(
+					options.cwd,
+					config,
+					state,
+					task,
+					notify,
+					liveLog,
+				);
+				reporter.stage(
+					"brief",
+					brief.recommendedAction === "stop" ? "failed" : "done",
+					`${brief.taskRisk} risk; ${brief.blockingQuestions.length} blocking question(s)`,
+				);
+				markHybridRunStage(
+					options.cwd,
+					config,
+					state,
+					runState,
+					"brief",
+					brief.recommendedAction === "stop" ? "failed" : "done",
+					undefined,
+					undefined,
+					brief.recommendedAction === "stop"
+						? "Orchestration brief recommended stop."
+						: undefined,
+				);
+				if (brief.recommendedAction === "stop") {
+					throw new Error(
+						"Hybrid orchestration brief recommended stop. See .pi-harness/orchestration-brief.md",
+					);
+				}
+			}
+			if (seriousTaskPolicyApplies(brief)) {
+				reporter.stage(
+					"plan-review",
+					"running",
+					`validating ${brief.taskRisk} risk plan before local-loop`,
+				);
+				markHybridRunStage(
+					options.cwd,
+					config,
+					state,
+					runState,
+					"plan-review",
+					"running",
+				);
+				const { review: planReview, result: planReviewResult } = await runPlanReview(
+					options.cwd,
+					config,
+					state,
+					task,
+					brief,
+					notify,
+					liveLog,
+				);
+				const planReviewReady =
+					planReview.verdict === "READY" && planReviewResult.ok === true;
+				summary.push(
+					"## Plan review",
+					"",
+					`- Verdict: ${planReview.verdict}`,
+					`- plan_architect: ${planReview.planArchitectVerdict}`,
+					`- plan_critic: ${planReview.planCriticVerdict}`,
+					`- child execution: ${planReviewResult.ok ? "ok" : "failed"}`,
+					"",
+				);
+				reporter.stage(
+					"plan-review",
+					planReviewReady ? "done" : "failed",
+					`verdict=${planReview.verdict}; child=${planReviewResult.ok ? "ok" : "failed"}`,
+				);
+				markHybridRunStage(
+					options.cwd,
+					config,
+					state,
+					runState,
+					"plan-review",
+					planReviewReady ? "done" : "failed",
+					undefined,
+					undefined,
+					!planReviewReady
+						? planReviewResult.ok
+							? "Plan review blocked local implementation."
+							: "Plan review child execution failed."
+						: undefined,
+				);
+				if (!planReviewReady) {
+					throw new Error(
+						planReviewResult.ok
+							? "Hybrid plan review blocked implementation. See .pi-harness/plan-review.md"
+							: "Hybrid plan review blocked implementation because the plan review child execution failed. See .pi-harness/plan-review.md",
+					);
+				}
+			} else {
+				summary.push(
+					"## Plan review",
+					"",
+					`- Skipped: ${brief.taskRisk} risk task.`,
+					"",
+				);
+				reporter.stage(
+					"plan-review",
+					"skipped",
+					`${brief.taskRisk} risk; serious-task gate not required`,
+				);
+				markHybridRunStage(
+					options.cwd,
+					config,
+					state,
+					runState,
+					"plan-review",
+					"skipped",
+				);
+			}
 		}
 
 		let finalVerdict: ReturnType<typeof parseFrontierVerdict> = "UNKNOWN";
@@ -6450,6 +7208,52 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("hybrid-interview", {
+		description:
+			"Run a frontier-owned requirements interview and write requirements.md",
+		handler: async (args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			const state = loadState(ctx.cwd, config);
+			const result = await runFrontierInterview(
+				ctx.cwd,
+				config,
+				state,
+				args,
+				(message, type = "info") => ctx.ui.notify(message, type),
+			);
+			const report = readArtifact(ctx.cwd, config, "requirements.md");
+			setStatusWidget(ctx, report);
+			await showReport("Hybrid Interview", report, ctx);
+			ctx.ui.notify(
+				`Hybrid interview ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/requirements.md`,
+				result.ok ? "info" : "warning",
+			);
+		},
+	});
+
+	pi.registerCommand("hybrid-grill", {
+		description:
+			"Run a frontier-owned design grill and write design-grill.md",
+		handler: async (args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			const state = loadState(ctx.cwd, config);
+			const result = await runFrontierGrill(
+				ctx.cwd,
+				config,
+				state,
+				args,
+				(message, type = "info") => ctx.ui.notify(message, type),
+			);
+			const report = readArtifact(ctx.cwd, config, "design-grill.md");
+			setStatusWidget(ctx, report);
+			await showReport("Hybrid Grill", report, ctx);
+			ctx.ui.notify(
+				`Hybrid grill ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/design-grill.md`,
+				result.ok ? "info" : "warning",
+			);
+		},
+	});
+
 	pi.registerCommand("hybrid-steer", {
 		description:
 			"Queue a parent steering note for the next hybrid child session/stage boundary",
@@ -6568,7 +7372,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 
 	pi.registerCommand("hybrid-models", {
 		description:
-			"Pick local worker, local reviewer, or frontier model from Pi's available models",
+			"Pick local worker, local control reviewer, or frontier model from Pi's available models",
 		handler: async (_args, ctx) => {
 			if (!ctx.ui?.custom || !ctx.modelRegistry?.getAvailable) {
 				ctx.ui?.notify?.("Hybrid model picker requires interactive Pi UI.", "warning");
@@ -6869,6 +7673,12 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				"6. Verification commands",
 				"7. Risks and frontier re-check triggers",
 				"8. Local worker prompt notes",
+				"",
+				"Verification design requirements:",
+				"- Each acceptance criterion needs an executable verification contract: sample input, command/script/manual procedure, and expected output or diff.",
+				"- Separate source evidence from runtime evidence.",
+				"- Identify at least one adversarial probe and any state reentry/idempotency probe needed.",
+				"- Treat build passed, HTTP 200, server responds, import succeeds, and smoke checks as baseline only.",
 			].join("\n");
 			const architect = await runPiOnce({
 				cwd: ctx.cwd,
@@ -7006,7 +7816,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 
 	pi.registerCommand("hybrid-review", {
 		description:
-			"Run local read-only review/audit of the implementation diff and evidence",
+			"Run frontier read-only review/audit of the implementation diff and evidence",
 		handler: async (_args, ctx) => {
 			const config = loadConfig(ctx.cwd);
 			const state = loadState(ctx.cwd, config);
@@ -7018,7 +7828,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			);
 			setStatusWidget(ctx, statusMarkdown(ctx.cwd, config, state));
 			ctx.ui.notify(
-				`Hybrid local review complete: ${review.verdict}. Next: /hybrid-final`,
+				`Hybrid frontier implementation review complete: ${review.verdict}. Next: /hybrid-final`,
 				review.result.ok ? "info" : "warning",
 			);
 		},
@@ -7026,7 +7836,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 
 	pi.registerCommand("hybrid-final", {
 		description:
-			"Run frontier final gate over design, diff, local evidence, and local review",
+			"Run frontier final gate over design, diff, local evidence, and implementation review",
 		handler: async (_args, ctx) => {
 			const config = loadConfig(ctx.cwd);
 			const state = loadState(ctx.cwd, config);

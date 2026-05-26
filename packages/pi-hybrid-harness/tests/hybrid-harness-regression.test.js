@@ -14,6 +14,14 @@ function between(startNeedle, endNeedle) {
 	return source.slice(start, end);
 }
 
+function assertOrder(block, firstNeedle, secondNeedle) {
+	const first = block.indexOf(firstNeedle);
+	const second = block.indexOf(secondNeedle);
+	assert.notEqual(first, -1, `missing ordered marker: ${firstNeedle}`);
+	assert.notEqual(second, -1, `missing ordered marker: ${secondNeedle}`);
+	assert.ok(first < second, `expected ${firstNeedle} before ${secondNeedle}`);
+}
+
 test("report overlays use the custom UI whenever interactive UI is available", () => {
 	const block = between("const showReport = async", "let activeHybridMonitorClose");
 	assert.match(block, /if \(ctx\?\.hasUI && ctx\?\.ui\?\.custom\) \{/);
@@ -281,6 +289,172 @@ test("hybrid retry and resume-from clear stage checkpoints", () => {
 	assert.match(source, /clearHybridStageFrom\(ctx\.cwd,\s*config,\s*state,\s*args\.trim\(\)/);
 });
 
+test("serious task plan review is a first-class stage before local implementation", () => {
+	assert.match(source, /type PlanReviewVerdict = "READY" \| "NEEDS_REVISION" \| "ESCALATE_TO_USER"/);
+
+	const stageTypeBlock = between("type HybridRunStageId =", "interface HybridRunStage");
+	assert.match(stageTypeBlock, /\|\s*"plan-review"/);
+
+	const orderBlock = between("const HYBRID_STAGE_ORDER", "function normalizeHybridRunStageId");
+	assertOrder(orderBlock, '"plan-review"', '"local-loop"');
+
+	const detailsBlock = between("function createHybridRunDetails", "function normalizeHybridRunDetailsForRender");
+	assertOrder(detailsBlock, 'id: "plan-review"', 'id: "local-loop"');
+
+	const readinessBlock = between("function hybridStageArtifactsReady", "function shouldSkipHybridStage");
+	assert.match(readinessBlock, /stage === "plan-review"[\s\S]*planReviewArtifactReady/);
+	assert.match(readinessBlock, /stage === "finish"[\s\S]*"claim-evidence-matrix\.md"/);
+
+	const artifactBlock = between("function hybridStageArtifactNames", "function clearHybridStageCheckpoint");
+	assert.match(artifactBlock, /stage === "plan-review"[\s\S]*"plan-review\.md"/);
+	assert.match(artifactBlock, /stage === "finish"[\s\S]*"claim-evidence-matrix\.md"/);
+
+	const cleanBlock = between("function cleanRunArtifacts", "function truncateMiddle");
+	assert.match(cleanBlock, /"plan-review\.md"/);
+
+	const syncBlock = between("function syncHarnessArtifacts", "function reconcileHybridCompletion");
+	assert.match(syncBlock, /"plan-review\.md"/);
+});
+
+test("frontier design gate commands use frontier model and durable artifacts", () => {
+	assert.match(source, /async function runFrontierInterview/);
+	assert.match(source, /async function runFrontierGrill/);
+
+	const interviewBlock = between("async function runFrontierInterview", "async function runFrontierGrill");
+	assert.match(interviewBlock, /FRONTIER REQUIREMENTS INTERVIEWER/);
+	assert.match(interviewBlock, /frontier owns design\/requirements judgment/i);
+	assert.match(interviewBlock, /local\/Qwen may provide repo facts/i);
+	assert.match(interviewBlock, /must not implement/i);
+	assert.match(interviewBlock, /ask exactly one next question/i);
+	assert.match(interviewBlock, /implementation-ready handoff/i);
+	assert.match(interviewBlock, /model: config\.frontierModel/);
+	assert.match(interviewBlock, /thinking: config\.frontierThinking/);
+	assert.match(interviewBlock, /writeArtifact\([^)]*"requirements\.md"/s);
+
+	const grillBlock = between("async function runFrontierGrill", "async function runHybridStart");
+	assert.match(grillBlock, /FRONTIER DESIGN GRILL/);
+	assert.match(grillBlock, /frontier owns design\/requirements judgment/i);
+	assert.match(grillBlock, /rejected alternatives/i);
+	assert.match(grillBlock, /failure modes/i);
+	assert.match(grillBlock, /compatibility/i);
+	assert.match(grillBlock, /rollout/i);
+	assert.match(grillBlock, /ask exactly one next question/i);
+	assert.match(grillBlock, /model: config\.frontierModel/);
+	assert.match(grillBlock, /thinking: config\.frontierThinking/);
+	assert.match(grillBlock, /writeArtifact\([^)]*"design-grill\.md"/s);
+
+	const cleanBlock = between("function cleanRunArtifacts", "function truncateMiddle");
+	assert.match(cleanBlock, /"requirements\.md"/);
+	assert.match(cleanBlock, /"design-grill\.md"/);
+
+	const syncBlock = between("function syncHarnessArtifacts", "function reconcileHybridCompletion");
+	assert.match(syncBlock, /"requirements\.md"/);
+	assert.match(syncBlock, /"design-grill\.md"/);
+
+	const commandBlock = between('pi.registerCommand("hybrid-interview"', 'pi.registerCommand("hybrid-steer"');
+	assert.match(commandBlock, /pi\.registerCommand\("hybrid-interview"/);
+	assert.match(commandBlock, /runFrontierInterview\(/);
+	assert.match(commandBlock, /showReport\("Hybrid Interview"/);
+	assert.match(commandBlock, /pi\.registerCommand\("hybrid-grill"/);
+	assert.match(commandBlock, /runFrontierGrill\(/);
+	assert.match(commandBlock, /showReport\("Hybrid Grill"/);
+});
+
+test("plan review parser blocks missing, non-ready, or disagreed verdicts", () => {
+	assert.match(source, /function normalizePlanReviewVerdict/);
+	assert.match(source, /function normalizePlanReview/);
+	assert.match(source, /function parsePlanReviewVerdict/);
+
+	const normalizeVerdictBlock = between("function normalizePlanReviewVerdict(", "function normalizePlanReview(");
+	assert.match(normalizeVerdictBlock, /value === "READY"/);
+	assert.match(normalizeVerdictBlock, /value === "NEEDS_REVISION"/);
+	assert.match(normalizeVerdictBlock, /value === "ESCALATE_TO_USER"/);
+	assert.match(normalizeVerdictBlock, /return "NEEDS_REVISION"/);
+
+	const normalizeReviewBlock = between("function normalizePlanReview", "function planReviewToMarkdown");
+	assert.match(normalizeReviewBlock, /planArchitectVerdict[\s\S]*!== "READY"/);
+	assert.match(normalizeReviewBlock, /planCriticVerdict[\s\S]*!== "READY"/);
+	assert.match(normalizeReviewBlock, /verdict[\s\S]*!== "READY"/);
+	assert.match(normalizeReviewBlock, /"ESCALATE_TO_USER"/);
+	assert.match(normalizeReviewBlock, /"NEEDS_REVISION"/);
+});
+
+test("serious task plan review gate runs after brief and before local loop", () => {
+	assert.match(source, /function seriousTaskPolicyApplies/);
+	assert.match(source, /async function runPlanReview/);
+
+	const policyBlock = between("function seriousTaskPolicyApplies", "function parsePlanReviewVerdict");
+	assert.match(policyBlock, /brief\.taskRisk === "medium"/);
+	assert.match(policyBlock, /brief\.taskRisk === "high"/);
+
+	const orchestrationBlock = between("async function runHybridOrchestration", "export default async function hybridHarness");
+	assertOrder(orchestrationBlock, "createOrchestrationBrief", "runPlanReview");
+	assertOrder(orchestrationBlock, "runPlanReview", "runLocalLoop");
+	assert.match(orchestrationBlock, /briefBeforeImplementation=false/);
+	assert.match(orchestrationBlock, /seriousTaskPolicyApplies\(brief\)/);
+	assert.match(orchestrationBlock, /const planReviewReady =/);
+	assert.match(orchestrationBlock, /if \(!planReviewReady\)/);
+	assert.match(orchestrationBlock, /plan review blocked implementation/i);
+});
+
+test("plan review child execution must succeed before local implementation", () => {
+	const orchestrationBlock = between("async function runHybridOrchestration", "export default async function hybridHarness");
+	assert.match(source, /function planReviewArtifactReady/);
+	assert.match(source, /function parsePlanReviewChildOk/);
+	assert.match(orchestrationBlock, /const \{ review: planReview,\s*result: planReviewResult \} = await runPlanReview/);
+	assert.match(orchestrationBlock, /planReviewResult\.ok === true/);
+	assert.match(orchestrationBlock, /planReview\.verdict === "READY" && planReviewResult\.ok === true/);
+	assert.match(orchestrationBlock, /Plan review child execution failed/);
+
+	const reuseBlock = between("function planReviewArtifactReady", "function shouldSkipHybridStage");
+	assert.match(reuseBlock, /parsePlanReviewVerdict/);
+	assert.match(reuseBlock, /parsePlanReviewChildOk/);
+	assert.match(reuseBlock, /=== true/);
+});
+
+test("plan review prompt uses portable architect and critic rubrics", () => {
+	const block = between("async function runPlanReview", "async function runHybridOrchestration");
+	assert.match(block, /frontier-design\.md/);
+	assert.match(block, /implementation-plan\.json/);
+	assert.match(block, /orchestration-brief\.md/);
+	assert.match(block, /repo-map\.md/);
+	assert.match(block, /progress\.json/);
+	assert.match(block, /plan_architect/);
+	assert.match(block, /plan_critic/);
+	assert.match(block, /CWS-compatible/);
+	assert.match(block, /not CWS-dependent/);
+	assert.match(block, /planArchitectVerdict/);
+	assert.match(block, /planCriticVerdict/);
+	assert.match(block, /reviewedValidationContracts/);
+	assert.match(block, /sourceEvidence/);
+	assert.match(block, /runtimeEvidence/);
+});
+
+test("quality-impacting review gates route to frontier model", () => {
+	const planReviewBlock = between("async function runPlanReview", "async function createProgressFromDesign");
+	assert.match(planReviewBlock, /FRONTIER PLAN REVIEWER/);
+	assert.match(planReviewBlock, /model: config\.frontierModel/);
+	assert.match(planReviewBlock, /thinking: config\.frontierThinking/);
+	assert.doesNotMatch(planReviewBlock, /model: config\.localReviewerModel/);
+
+	const implementationReviewBlock = between("async function runLocalReview", "async function runFrontierFinal");
+	assert.match(implementationReviewBlock, /FRONTIER IMPLEMENTATION REVIEWER/);
+	assert.match(implementationReviewBlock, /model: config\.frontierModel/);
+	assert.match(implementationReviewBlock, /thinking: config\.frontierThinking/);
+	assert.match(implementationReviewBlock, /# Frontier Implementation Review/);
+	assert.doesNotMatch(implementationReviewBlock, /# Local Review/);
+	assert.doesNotMatch(implementationReviewBlock, /model: config\.localReviewerModel/);
+
+	const usageBlock = between("function usageSummaryMarkdown", "function statusMarkdown");
+	assert.match(usageBlock, /\{ name: "local-review\.md", bucket: "frontier" \}/);
+
+	const detailsBlock = between("function createHybridRunDetails", "function normalizeHybridRunDetailsForRender");
+	assert.match(detailsBlock, /id: "local-review", label: "Frontier implementation review"/);
+
+	const finalCommandBlock = between('pi.registerCommand("hybrid-final"', "});\n}");
+	assert.doesNotMatch(finalCommandBlock, /local review/);
+});
+
 test("child runs abort repeated tool patterns before burning time", () => {
 	assert.match(source, /function hybridToolPattern/);
 	const runBlock = between("async function runPiOnce", "async function fetchLocalModels");
@@ -288,4 +462,62 @@ test("child runs abort repeated tool patterns before burning time", () => {
 	assert.match(runBlock, /repeatedToolPatternCount/);
 	assert.match(runBlock, /stuck-loop-guard/);
 	assert.match(runBlock, /proc\.kill\("SIGTERM"\)/);
+});
+
+test("acceptance criteria carry executable verification contracts and evidence quality fields", () => {
+	const typeBlock = between("interface HarnessProgress", "interface VerificationSummary");
+	assert.match(typeBlock, /verificationContracts\?: string\[\]/);
+	assert.match(typeBlock, /evidenceType\?:/);
+	assert.match(typeBlock, /sourceEvidence\?: string\[\]/);
+	assert.match(typeBlock, /runtimeEvidence\?: string\[\]/);
+	assert.match(typeBlock, /adversarialProbes\?: string\[\]/);
+	assert.match(typeBlock, /reentryProbes\?: string\[\]/);
+	assert.match(typeBlock, /residualGaps\?: string\[\]/);
+
+	const markdownBlock = between("function progressToMarkdown", "function fallbackProgress");
+	assert.match(markdownBlock, /verification contracts/i);
+	assert.match(markdownBlock, /source evidence/i);
+	assert.match(markdownBlock, /runtime evidence/i);
+	assert.match(markdownBlock, /adversarial probes/i);
+	assert.match(markdownBlock, /reentry\/idempotency probes/i);
+	assert.match(markdownBlock, /residual gaps/i);
+});
+
+test("finish artifacts include a claim-evidence matrix separate from command summary", () => {
+	assert.match(source, /interface ClaimEvidenceRow/);
+	assert.match(source, /function claimEvidenceMatrixMarkdown/);
+	assert.match(source, /"claim-evidence-matrix\.md"/);
+	const finishBlock = between("function runVerificationSummary", "function isInteractiveRuntimeText");
+	assert.match(finishBlock, /claimEvidenceMatrixMarkdown\(progress,\s*summary\)/);
+	assert.match(finishBlock, /writeArtifact\([^)]*"claim-evidence-matrix\.md"/s);
+	assert.match(finishBlock, /Evidence type/);
+	assert.match(finishBlock, /What would fail if broken/);
+	assert.match(finishBlock, /Residual gap/);
+});
+
+test("local worker must distrust previous slices and avoid smoke-only completion", () => {
+	const promptBlock = between("function localWorkerPrompt", "type Notify");
+	assert.match(promptBlock, /smoke evidence cannot satisfy behavioral acceptance criteria/);
+	assert.match(promptBlock, /Before starting the next slice, re-check at least one critical claim from the previous completed slice/);
+	assert.match(promptBlock, /normal path/);
+	assert.match(promptBlock, /invalid input/);
+	assert.match(promptBlock, /state reentry/);
+	assert.match(promptBlock, /restart\/retry\/idempotency/);
+});
+
+test("local and frontier reviewers require claim-evidence review and adversarial probes", () => {
+	const localReviewBlock = between("async function runLocalReview", "async function runFrontierFinal");
+	assert.match(localReviewBlock, /claimEvidenceMatrix/);
+	assert.match(localReviewBlock, /implementationClaims/);
+	assert.match(localReviewBlock, /testAssertionQuality/);
+	assert.match(localReviewBlock, /independentAdversarialProbe/);
+	assert.match(localReviewBlock, /highRiskResidualBlockers/);
+	assert.match(localReviewBlock, /source-level evidence is not runtime evidence/);
+
+	const finalBlock = between("async function runFrontierFinal", "async function runHybridOrchestration");
+	assert.match(finalBlock, /claimEvidenceMatrix/);
+	assert.match(finalBlock, /What would fail if broken/);
+	assert.match(finalBlock, /minimum one counterexample/);
+	assert.match(finalBlock, /state reentry\/idempotency/);
+	assert.match(finalBlock, /public API, data integrity, authentication, payment, migration, or long-lived state/);
 });

@@ -80,6 +80,31 @@ Non-trivial means any task with one or more of:
 
 The package should be detailed enough that a Qwen agent can implement without making product or architecture decisions. For medium and large tasks, write the package and progress state into a harness folder so future turns can resume without reloading all prior conversation.
 
+### Verification contract hardening
+
+Completion means verified by reproducible evidence, not "implemented" or "looks good".
+
+Use the shared harness vocabulary from `docs/harness-contract.md` when available:
+
+- Executable verification contract: sample input, command/script/manual procedure, and expected output or diff.
+- Source evidence: static proof that code, prompts, config, or docs exist.
+- Runtime evidence: proof that behavior executed through unit, integration, e2e, CLI, API, UI, or manual procedure.
+- Smoke evidence: build passed, HTTP 200, server responds, import succeeds, or process starts.
+- Claim-evidence matrix: Claim, Evidence command, Evidence type, What would fail if broken, Residual gap.
+
+smoke evidence cannot satisfy behavioral acceptance criteria. It can only prove baseline survivability unless paired with behavioral runtime evidence.
+
+Each acceptance criterion must include at least one executable `verificationContracts` entry before Qwen implementation starts. If a criterion cannot be made executable, mark it as a blocker or ask the user/orchestrator for clarification.
+
+The orchestrator should spend frontier tokens on verification design early:
+
+- sharpen acceptance criteria into executable contracts
+- list likely failure modes
+- define the tester/verifier handoff
+- identify high-risk residual gaps that cannot be accepted without user or oracle review
+
+Qwen subagents should implement and run repair loops; frontier/oracle reasoning should focus on acceptance/test oracle quality and final counterexample review.
+
 ## Stateful Harness Mode
 
 For medium or large tasks, or whenever the user asks for resumable/progress-managed work, use a project-local harness directory.
@@ -109,6 +134,9 @@ Create these files for medium/large tasks:
   repo-map.md                # compact codebase map from explorer
   execution-package.md       # orchestrator design package
   decisions.md               # orchestrator-owned decisions and non-overridable constraints
+  plan-review.md             # serious task plan gate verdict before implementation
+  requirements.md            # frontier-owned requirements interview result
+  design-grill.md            # frontier-owned design stress-test result
   implementation-plan.json   # machine-readable slices/checkpoints/acceptance criteria
   progress.md                # human-readable current status
   progress.json              # machine-readable status
@@ -130,6 +158,46 @@ Create these files for medium/large tasks:
 ```
 
 Small tasks may skip the harness folder unless the user explicitly requests durable state.
+
+### Serious task plan review gate
+
+Automatically treat the work as a serious task when `taskRisk` is `medium` or `high`, or when the request spans multiple components, public API/CLI/schema/auth/data integrity, ordered implementation, rollback compatibility, or multiple verification commands.
+
+For serious task work, do not begin Qwen implementation until the plan has a CWS-compatible review artifact with a `READY` verdict. Use either one combined `plan-review.md` file or equivalent split artifacts:
+
+```text
+.qwen-harness/
+  plan-review.md
+  plan-architect-review.md
+  plan-critic-review.md
+```
+
+The plan review must include:
+
+- `planArchitectVerdict`: `READY`, `NEEDS_REVISION`, or `ESCALATE_TO_USER`
+- `planCriticVerdict`: `READY`, `NEEDS_REVISION`, or `ESCALATE_TO_USER`
+- final `verdict`: `READY`, `NEEDS_REVISION`, or `ESCALATE_TO_USER`
+- blocking issues
+- required revisions
+- reviewed validation contracts
+- residual risks
+- next action
+
+No implementation until READY. Any `NEEDS_REVISION`, any `ESCALATE_TO_USER`, or any missing/unknown verdict blocks implementation. The review should use plan architect and plan critic rubrics, but it must remain portable; do not depend on Codex-native subagents being available inside the Qwen harness.
+
+### Frontier-owned quality gates
+
+Quality-impacting gates are frontier-owned. The `plan-review.md` gate is frontier-owned, and Qwen implementation starts after READY rather than before or during that judgment.
+
+Qwen agents may gather repo facts, implement slices, run tests, and repair failures after READY. They should not own plan review, implementation review, final approval, or other quality gates that decide whether work may proceed or ship.
+
+### Frontier-owned requirements and design gates
+
+When requirements are ambiguous, broad, or likely to cause rework, route clarification through `/hybrid-interview <request-or-answer>` before preparing Qwen implementation handoffs. The durable artifact is `requirements.md`.
+
+When the design, architecture, workflow, domain model, or tradeoff space needs pressure testing, route it through `/hybrid-grill <plan-or-design>`. The durable artifact is `design-grill.md`.
+
+Qwen agents may gather repo facts, code references, dependency behavior, and verification evidence for these gates, but the frontier model owns requirements and design judgment. No Qwen implementation until the relevant `requirements.md`, `design-grill.md`, and serious-task `plan-review.md` gates are ready.
 
 ### Artifact content rules
 
@@ -290,7 +358,13 @@ Use this shape for `implementation-plan.json`:
       "id": "AC1",
       "description": "observable acceptance criterion",
       "status": "pending | passed | failed",
-      "evidence": []
+      "verificationContracts": ["fixture/input + command/script/manual procedure + expected output/diff"],
+      "evidenceType": "unit | integration | e2e | manual | static | smoke",
+      "sourceEvidence": [],
+      "runtimeEvidence": [],
+      "adversarialProbes": [],
+      "reentryProbes": [],
+      "residualGaps": []
     }
   ],
   "blockers": [],
@@ -339,7 +413,7 @@ Update harness artifacts at these points:
 3. After orchestrator design: write `execution-package.md`, `decisions.md`, and `implementation-plan.json`.
 4. Before each Qwen delegation: write a `handoffs/<slice>-<agent>-<attempt>.md` file, mark slice `in_progress`, append `delegated` event.
 5. After each Qwen result: update slice status, remaining work, evidence, blockers, and `progress.md`.
-6. After test/verification runs: append command/result evidence and update acceptance criteria.
+6. After test/verification runs: append command/result evidence and update acceptance criteria. Keep sourceEvidence and runtimeEvidence separate; sourceEvidence alone does not prove behavior.
 7. Before final response: write `evidence-bundle.md` and mark `state.phase = completed` or `blocked`.
 
 Do not let Qwen agents make broad plan/status decisions. They may update their assigned slice evidence if explicitly asked, but the orchestrator owns the canonical plan, acceptance criteria, and final state transitions.
@@ -369,6 +443,8 @@ Return changed files, commands run, evidence, blockers, and whether S3 is comple
 
 The parent orchestrator should then update the canonical harness files.
 
+At each slice start, do not blindly trust the previous slice. Re-check at least one critical claim from the previous slice before depending on it, and record that previous slice checkpoint in the current slice evidence.
+
 ### Handoff files
 
 Every delegated Qwen task for medium/large work should be saved first under `handoffs/`.
@@ -390,6 +466,8 @@ Each handoff should include:
 - files allowed to edit
 - files forbidden to edit
 - verification command or discovery instruction
+- executable acceptance criteria and verificationContracts relevant to the slice
+- a reminder that smoke evidence cannot satisfy behavioral acceptance criteria
 - stop rules
 - return format
 
@@ -491,7 +569,7 @@ If commands are unknown:
 - explorer: what to inspect and return
 - librarian: what docs/API facts to verify, if needed
 - fixer: exact implementation slice
-- tester: exact test/verification slice
+- tester/verifier: exact test/verification slice; extract implementationClaims, build a claim-evidence matrix, require sourceEvidence/runtimeEvidence by claim, run minimum one counterexample or edge case, include a state reentry or restart/retry/idempotency probe when state is involved, and fail unsupported claims
 - designer: exact UI/UX slice, if needed
 - oracle: only if escalation policy is met
 ```
@@ -618,6 +696,15 @@ Scope:
 
 Constraints:
 - Behavior that must not change.
+- Build/import/HTTP 200 smoke checks are not behavioral proof.
+- Before starting this slice, re-check at least one critical previous slice claim if this slice depends on previous slice output.
+
+Verification contract:
+- Acceptance criteria with `verificationContracts`.
+- Required sourceEvidence and runtimeEvidence.
+- Required adversarial probe: minimum one counterexample, edge case, alternate call order, or invalid input.
+- Required state probe when applicable: state reentry and restart/retry/idempotency.
+
 - APIs/contracts to preserve.
 - Style or patterns to follow.
 
@@ -635,10 +722,36 @@ Verification:
 - Specific commands to run, or ask the agent to discover the smallest relevant command.
 
 Return:
+- implementationClaims.
+- claim-evidence matrix.
 - Files changed.
 - Summary of behavior.
 - Commands run and results.
+- Evidence type for each claim.
+- What would fail if broken.
+- residualGaps.
 - Any blockers/decisions needed.
+```
+
+### Tester/verifier contract
+
+The tester/verifier is not a build checker. It must:
+
+- extract implementationClaims from the fixer output, diff, and changed files
+- demand evidence for every claim
+- separate sourceEvidence from runtimeEvidence
+- reject source-only proof for behavioral acceptance criteria
+- run minimum one counterexample or edge case independent of the implementer's happy path
+- run a state reentry or restart/retry/idempotency probe when the slice touches state, persistence, retries, or resumability
+- review test assertion quality, including postconditions, shortcut mocks, synthetic-only tests, and whether tests bypass the real user/API path
+- fail any claim without evidence
+- escalate residualGaps as blockers for public API, data integrity, authentication, payment, migration, or long-lived state
+
+Use this matrix in `evidence-bundle.md`:
+
+```text
+| Claim | Evidence command | Evidence type | What would fail if broken? | Residual gap |
+| --- | --- | --- | --- | --- |
 ```
 
 ## Parallelization

@@ -4,7 +4,7 @@
 
 핵심 목표는 세 가지입니다.
 
-- Pi에서는 local Qwen worker/reviewer와 frontier final gate를 조합한 실행 루프를 제공합니다.
+- Pi에서는 local Qwen scout/worker/repair loop와 frontier design/review/final gate를 조합한 실행 루프를 제공합니다.
 - Codex에서는 `.qwen-harness/` 상태를 기준으로 Pi/local Qwen에 scout/implementation/evidence loop를 위임하고, Codex가 frontier orchestration과 final gate를 맡습니다.
 - OpenCode에서는 같은 harness 진행 상태를 읽고, Qwen-first 작업 흐름과 TUI sidebar 상태 패널을 제공합니다.
 
@@ -50,12 +50,12 @@
 
 ### `packages/pi-hybrid-harness`
 
-Pi용 package/extension입니다. local Qwen 모델을 worker와 reviewer로 쓰고, frontier 모델을 설계와 final gate에 집중시키는 hybrid 실행 흐름을 제공합니다.
+Pi용 package/extension입니다. local Qwen 모델을 scout, worker, repair, progress bookkeeping에 쓰고, frontier 모델을 설계와 품질 게이트에 집중시키는 hybrid 실행 흐름을 제공합니다.
 
 주요 기능:
 
 - `/hybrid-run`, `/hybrid-run-fast`, `/hybrid-run-thorough`
-- local scout, frontier design, local implementation loop, local review, frontier final review
+- local scout, frontier design, local implementation loop, frontier implementation review, frontier final review
 - `.pi-harness/` 기반 durable artifact 저장
 - background run, live monitor, steering, cancel, retry, resume
 - token routing 및 frontier token 절약 추정
