@@ -92,6 +92,7 @@ export function doctorQwenHarnessCodex(options = {}) {
   const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
   const piBinary = options.piBinary ?? "pi";
   const piCheck = spawnSync(piBinary, ["--version"], { encoding: "utf8", shell: false });
+  const rubyCheck = spawnSync("ruby", ["-v"], { encoding: "utf8", shell: false });
   return {
     codexHome,
     canonicalStateDir: CANONICAL_STATE_DIR,
@@ -103,6 +104,7 @@ export function doctorQwenHarnessCodex(options = {}) {
     mcpConfigured: config.includes(`[mcp_servers.${MCP_SERVER_NAME}]`),
     piBinary,
     piBinaryAvailable: !piCheck.error,
+    rubyAvailable: !rubyCheck.error,
   };
 }
 

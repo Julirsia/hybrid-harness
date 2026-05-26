@@ -49,6 +49,8 @@ qwen-harness-codex uninstall
 
 `scout` and `delegate` default to dry-run mode. Pass `--live` to actually call the `pi` binary.
 
+For local HTTP providers such as `local-qwen` on a LAN address, live mode creates a temporary Pi config and routes Pi through a localhost TCP proxy. This avoids macOS/local-network cases where `curl` can reach the Qwen server but Node-based Pi cannot connect to the LAN IP directly. The proxy is started only for the live run and requires `ruby` to be available.
+
 ## MCP Tools
 
 - `codex_harness_scout`

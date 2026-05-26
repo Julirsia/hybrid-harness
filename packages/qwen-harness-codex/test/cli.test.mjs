@@ -47,6 +47,7 @@ describe("qwen-harness-codex CLI", () => {
       const report = JSON.parse(doctor.stdout);
       assert.equal(report.canonicalStateDir, ".qwen-harness");
       assert.equal(typeof report.piBinaryAvailable, "boolean");
+      assert.equal(typeof report.rubyAvailable, "boolean");
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }
