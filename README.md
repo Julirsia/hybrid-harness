@@ -24,6 +24,7 @@
 │   │   └── README.md
 │   └── qwen-harness-opencode/
 │       ├── .claude-plugin/
+│       ├── bin/
 │       ├── plugins/
 │       ├── skills/
 │       ├── src/
@@ -126,7 +127,29 @@ npx ./packages/pi-hybrid-harness install -l --source ./packages/pi-hybrid-harnes
 /reload
 ```
 
-### OpenCode plugin을 이 checkout에서 설치
+### OpenCode plugin 사용자 설치
+
+다른 기기에서는 clone 없이 npm package에서 설치합니다.
+
+```sh
+npx qwen-harness-opencode install
+```
+
+업데이트:
+
+```sh
+npx qwen-harness-opencode update
+```
+
+제거:
+
+```sh
+npx qwen-harness-opencode uninstall
+```
+
+설치 후 OpenCode TUI를 재시작해야 sidebar plugin이 로드됩니다.
+
+### OpenCode plugin을 이 checkout에서 개발 설치
 
 저장소 루트에서:
 
@@ -139,8 +162,6 @@ npm run install:opencode
 ```sh
 ./packages/qwen-harness-opencode/install.sh
 ```
-
-설치 후 OpenCode TUI를 재시작해야 sidebar plugin이 로드됩니다.
 
 제거:
 
@@ -160,11 +181,14 @@ npm run test:qwen
 # Pi package dry-run pack
 npm run pack:pi
 
-# OpenCode plugin 설치
+# OpenCode plugin 사용자 설치
+npx qwen-harness-opencode install
+
+# OpenCode plugin 개발 checkout 설치
 npm run install:opencode
 
 # OpenCode plugin 제거
-npm run uninstall:opencode
+npx qwen-harness-opencode uninstall
 ```
 
 ## 변경할 때 지켜야 할 규칙
@@ -222,7 +246,7 @@ npm pack --dry-run -w qwen-harness-opencode
 
 루트 `package-lock.json`은 monorepo workspace 개발과 검증을 위한 lockfile입니다.
 
-`packages/qwen-harness-opencode/package-lock.json`도 유지합니다. 이 패키지는 standalone으로 설치될 수 있고, installer가 package directory 안에서 `npm install`을 실행하기 때문입니다.
+`packages/qwen-harness-opencode/package-lock.json`도 유지합니다. 이 패키지는 standalone으로 개발/검증될 수 있고, installer가 사용자 OpenCode config directory 안에서 필요한 TUI runtime dependency를 설치할 수 있기 때문입니다.
 
 OpenCode package 의존성을 바꿀 때는 다음을 함께 확인하세요.
 
@@ -243,8 +267,8 @@ npm test --workspaces --if-present
 이 저장소를 만들 때 확인한 기준:
 
 - Pi package 테스트: 28개 통과
-- Qwen/OpenCode package 테스트: 5개 통과
-- OpenCode shell installer syntax check 통과
+- Qwen/OpenCode package 테스트: 9개 통과
+- OpenCode npm installer copy/update/uninstall 테스트 통과
 - 주요 JS/MJS entrypoint `node --check` 통과
 - Pi package `npm pack --dry-run` 통과
 - OpenCode package `npm pack --dry-run` 통과

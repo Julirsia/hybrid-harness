@@ -25,13 +25,27 @@ Token efficiency is calculated from `tokenUsage`, `usage`, or `tokens` objects i
 
 ## Install
 
+From npm:
+
+```sh
+npx qwen-harness-opencode install
+```
+
+Update later with:
+
+```sh
+npx qwen-harness-opencode update
+```
+
+For local development from the monorepo checkout:
+
 ```sh
 npm run install:opencode
-# or, from the monorepo root:
+# or:
 ./packages/qwen-harness-opencode/install.sh
 ```
 
-The installer symlinks this package into:
+The installer copies this package's OpenCode assets into:
 
 ```text
 ~/.config/opencode/plugins/qwen-harness-status.tsx
@@ -39,14 +53,24 @@ The installer symlinks this package into:
 ~/.config/opencode/skills/qwen-first-delegation-workflow
 ```
 
-It adds this package's TUI plugin path to `~/.config/opencode/tui.json`. It does not modify `opencode.json` or `oh-my-opencode-slim` settings.
+It adds the copied TUI plugin path to `~/.config/opencode/tui.json` and writes `~/.config/opencode/qwen-harness-opencode.json` so future updates know which files are managed by this package. It does not modify `opencode.json` or `oh-my-opencode-slim` settings.
+
+If `~/.config/opencode/package.json` exists, the installer also installs the TUI runtime dependencies needed by the plugin. Pass `--no-config-deps` to skip that step.
 
 ## Uninstall
 
+From npm:
+
+```sh
+npx qwen-harness-opencode uninstall
+```
+
+For local development from the monorepo checkout:
+
 ```sh
 npm run uninstall:opencode
-# or, from the monorepo root:
+# or:
 ./packages/qwen-harness-opencode/uninstall.sh
 ```
 
-Existing non-symlink files are never removed by the uninstaller.
+The uninstaller removes only files recorded in the package manifest. Pre-existing unmanaged files are backed up during install instead of being overwritten.
