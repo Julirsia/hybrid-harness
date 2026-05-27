@@ -248,6 +248,7 @@ interface HybridRunLock {
 
 interface HybridChildStats {
 	label: string;
+	model?: string;
 	status: "running" | "done" | "failed";
 	startedAt: string;
 	updatedAt: string;
@@ -287,6 +288,10 @@ interface HybridRunDetails {
 		acceptanceSatisfied: number;
 		acceptanceTotal: number;
 		activeFrontierTriggers: number;
+		currentSliceId?: string;
+		currentSliceTitle?: string;
+		currentSliceStatus?: SliceStatus;
+		currentSliceRemaining?: string;
 		nextAction?: string;
 	};
 	localVerdict?: ReturnType<typeof parseLocalVerdict>;
@@ -933,11 +938,51 @@ const HYBRID_STAGE_ORDER: HybridRunStageId[] = [
 	"summary",
 ];
 
+function hybridStageDescriptionKo(stage: HybridRunStageId): string {
+	switch (stage) {
+		case "checkpoint":
+			return "git/작업공간 사전 확인";
+		case "design":
+			return "로컬 저장소 조사와 frontier 설계/슬라이스 계획";
+		case "brief":
+			return "구현 전 모호성 확인과 사용자 clarification 게이트";
+		case "plan-review":
+			return "구현 시작 전 실행 계획 검증";
+		case "local-loop":
+			return "로컬 구현, 테스트, repair 루프";
+		case "finish":
+			return "결과 정리, 결정적 검증, evidence 정리";
+		case "local-review":
+			return "frontier가 구현 결과를 리뷰";
+		case "frontier-final":
+			return "최종 frontier 승인/변경요청 게이트";
+		case "summary":
+			return "run summary와 usage summary 생성";
+	}
+}
+
+function hybridStageReferenceMarkdown(): string {
+	return [
+		"## 재개 가능한 단계",
+		"",
+		"그냥 이어가려면 `/hybrid-resume`을 사용하세요.",
+		"",
+		"`/hybrid-resume-from <stage>`에 아래 stage ID를 사용할 수 있습니다.",
+		"",
+		...HYBRID_STAGE_ORDER.map(
+			(stage) =>
+				`- \`${stage}\` - ${hybridStageLabelKo(stage)}: ${hybridStageDescriptionKo(stage)}`,
+		),
+		"",
+		"예: `/hybrid-resume-from brief`",
+	].join("\n");
+}
+
 function normalizeHybridRunStageId(value: string): HybridRunStageId {
 	const normalized = value.trim() as HybridRunStageId;
 	if (!HYBRID_STAGE_ORDER.includes(normalized)) {
 		throw new Error(
-			`Unknown hybrid stage "${value}". Expected one of: ${HYBRID_STAGE_ORDER.join(", ")}`,
+			`Unknown hybrid stage "${value}". Expected one of: ${HYBRID_STAGE_ORDER.join(", ")}. Run /hybrid-stages to see descriptions.`,
 		);
 	}
 	return normalized;
@@ -1057,36 +1102,57 @@ function isDestructiveCommand(command: string): string | undefined {
 	return checks.find(([regex]) => regex.test(command))?.[1];
 }
 
+const HYBRID_RUN_ARTIFACTS = [
+	"state.json",
+	"task.md",
+	"repo-map.md",
+	"frontier-design.md",
+	"implementation-plan.json",
+	"progress.json",
+	"progress.md",
+	"test-evidence.md",
+	"claim-evidence-matrix.md",
+	"plan-review.md",
+	"requirements.md",
+	"design-grill.md",
+	"verification-summary.json",
+	"verification-summary.md",
+	"local-log.md",
+	"git-summary.md",
+	"local-review.md",
+	"final-review.md",
+	"run-summary.md",
+	"run-state.json",
+	"active-run.json",
+	"usage-summary.md",
+	"orchestration-brief.md",
+	"user-clarifications.md",
+	"steering.jsonl",
+	"live-log.md",
+	"events.jsonl",
+] as const;
+
+function archiveHybridRunArtifacts(cwd: string, config: HarnessConfig): string | undefined {
+	const existing = HYBRID_RUN_ARTIFACTS.filter((name) =>
+		fs.existsSync(artifactPath(cwd, config, name)),
+	);
+	if (!existing.length) return undefined;
+	const archiveId = nowIso().replace(/[:.]/g, "-");
+	const archiveDir = path.join(cwd, config.stateDir, "runs", archiveId);
+	fs.mkdirSync(archiveDir, { recursive: true });
+	for (const name of existing) {
+		fs.copyFileSync(artifactPath(cwd, config, name), path.join(archiveDir, name));
+	}
+	fs.writeFileSync(
+		path.join(archiveDir, "archive-manifest.json"),
+		`${JSON.stringify({ version: 1, archivedAt: nowIso(), files: existing }, null, "\t")}\n`,
+		"utf8",
+	);
+	return path.relative(cwd, archiveDir);
+}
+
 function cleanRunArtifacts(cwd: string, config: HarnessConfig): void {
-	for (const name of [
-		"state.json",
-		"task.md",
-		"repo-map.md",
-		"frontier-design.md",
-		"implementation-plan.json",
-		"progress.json",
-		"progress.md",
-		"test-evidence.md",
-		"claim-evidence-matrix.md",
-		"plan-review.md",
-		"requirements.md",
-		"design-grill.md",
-		"verification-summary.json",
-		"verification-summary.md",
-		"local-log.md",
-		"git-summary.md",
-		"local-review.md",
-		"final-review.md",
-		"run-summary.md",
-		"run-state.json",
-		"active-run.json",
-		"usage-summary.md",
-		"orchestration-brief.md",
-		"user-clarifications.md",
-		"steering.jsonl",
-		"live-log.md",
-		"events.jsonl",
-	]) {
+	for (const name of HYBRID_RUN_ARTIFACTS) {
 		try {
 			fs.rmSync(artifactPath(cwd, config, name), { force: true });
 		} catch {
@@ -1095,10 +1161,45 @@ function cleanRunArtifacts(cwd: string, config: HarnessConfig): void {
 	}
 }
 
+function startNewHybridTask(
+	cwd: string,
+	config: HarnessConfig,
+	task: string,
+): { state: HarnessState; archive?: string } {
+	const archive = archiveHybridRunArtifacts(cwd, config);
+	cleanRunArtifacts(cwd, config);
+	const state = loadState(cwd, config);
+	if (task) {
+		state.task = task;
+		writeArtifact(cwd, config, state, "task.md", `# Task\n\n${task}\n`);
+	}
+	saveState(cwd, config, state);
+	return { state, archive };
+}
+
 function truncateMiddle(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	const half = Math.floor((maxChars - 120) / 2);
 	return `${text.slice(0, half)}\n\n[... ${text.length - maxChars} chars omitted ...]\n\n${text.slice(-half)}`;
+}
+
+function hybridRequirementsContext(
+	cwd: string,
+	config: HarnessConfig,
+	maxChars = 40_000,
+): string[] {
+	const requirements = readArtifact(cwd, config, "requirements.md").trim();
+	if (!requirements) return [];
+	return [
+		"",
+		"Requirements interview artifact (authoritative when present):",
+		`- Source: ${config.stateDir}/requirements.md`,
+		"- Use this artifact as the product requirements source for design, planning, implementation, and review.",
+		"- Do not create or treat root REQUIREMENTS.md as a substitute for this harness artifact unless the task explicitly asks for a root requirements file.",
+		"```markdown",
+		truncateMiddle(requirements, maxChars),
+		"```",
+	];
 }
 
 function extractJsonObject<T>(text: string): T | undefined {
@@ -1185,6 +1286,13 @@ function classifyTestFailure(
 }
 
 function progressToMarkdown(progress: HarnessProgress): string {
+	const doneSlices = progress.slices.filter((slice) => slice.status === "done").length;
+	const satisfiedCriteria = progress.acceptanceCriteria.filter(
+		(criterion) => criterion.status === "satisfied",
+	).length;
+	const activeTriggers = progress.frontierRecheckTriggers.filter(
+		(trigger) => trigger.active,
+	).length;
 	const sliceLines = progress.slices.map((slice) =>
 		[
 			`### ${slice.id}: ${slice.title}`,
@@ -1216,6 +1324,16 @@ function progressToMarkdown(progress: HarnessProgress): string {
 	);
 	return [
 		"# Hybrid Progress",
+		"",
+		"## 한국어 요약",
+		"",
+		`- 작업: ${progress.task}`,
+		`- 현재 단계: ${progress.currentSliceId ?? "없음"}`,
+		`- 완료된 조각: ${doneSlices}/${progress.slices.length}`,
+		`- 충족된 승인 기준: ${satisfiedCriteria}/${progress.acceptanceCriteria.length}`,
+		`- 활성 frontier 재확인 항목: ${activeTriggers}`,
+		`- 다음 행동: ${progress.nextAction}`,
+		`- 차단 사유: ${progress.blockers.length ? progress.blockers.join("; ") : "없음"}`,
 		"",
 		`- Task: ${progress.task}`,
 		`- Current slice: ${progress.currentSliceId ?? "none"}`,
@@ -2191,6 +2309,7 @@ async function runPiOnce(options: {
 				if (!childEvent || !options.liveLabel) return;
 				childEvent(options.liveLabel, {
 					type: "usage_estimate",
+					model: options.model,
 					input: usage.estimatedInput,
 					output: usage.estimatedOutput,
 				});
@@ -2260,6 +2379,12 @@ async function runPiOnce(options: {
 				return;
 			}
 			effectiveSignal?.addEventListener("abort", abortHandler, { once: true });
+			if (childEvent && options.liveLabel) {
+				childEvent(options.liveLabel, {
+					type: "child_start",
+					model: options.model,
+				});
+			}
 			emitUsageEstimate();
 
 			const processLine = (line: string) => {
@@ -2588,6 +2713,17 @@ function statusMarkdown(
 	return [
 		"# Hybrid Harness Status",
 		"",
+		"## 한국어 요약",
+		"",
+		`- 현재 상태: ${state.phase}`,
+		`- 작업: ${state.task ?? "아직 설정되지 않음"}`,
+		`- 상태 디렉터리: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
+		`- 실행 중인 백그라운드 작업: ${activeLock ? `${activeLock.currentStage ?? "unknown"} (${activeLock.liveId})` : "없음"}`,
+		`- 대기 중인 steering 메모: ${queuedSteering}개`,
+		`- 사람이 확인할 주요 문서: ${config.stateDir}/requirements.md, ${config.stateDir}/progress.md, ${config.stateDir}/run-summary.md`,
+		"",
+		...hybridStageReferenceMarkdown().split("\n"),
+		"",
 		`- Phase: **${state.phase}**`,
 		`- State dir: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
 		`- Local worker: \`${config.localWorkerModel}\``,
@@ -2638,6 +2774,7 @@ function localWorkerPrompt(
 ): string {
 	const steering = cwd ? hybridSteeringMarkdown(cwd, config) : "";
 	if (steering && cwd) markHybridSteeringConsumed(cwd, config, "local-worker");
+	const requirementsContext = cwd ? hybridRequirementsContext(cwd, config) : [];
 	return [
 		"You are the LOCAL IMPLEMENTER in a hybrid Pi coding harness.",
 		"The frontier model already prepared the design. Follow it closely; do not redesign unless the repo proves it impossible.",
@@ -2655,11 +2792,13 @@ function localWorkerPrompt(
 		`Task: ${task}`,
 		`Iteration: ${iteration}`,
 		...(steering ? ["", steering] : []),
+		...requirementsContext,
 		config.testCommand
 			? `Configured test command: ${config.testCommand}`
 			: "Configured test command: none; infer from repository.",
 		"",
 		"Read these artifacts first:",
+		`- ${config.stateDir}/requirements.md if present`,
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/repo-map.md`,
 		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
@@ -2667,6 +2806,7 @@ function localWorkerPrompt(
 		`- ${config.stateDir}/local-review.md if present`,
 		`- ${config.stateDir}/final-review.md if present`,
 		"",
+		"If requirements.md is present in the harness state, do not create or use root REQUIREMENTS.md as a substitute requirements source.",
 		"If local-review.md or final-review.md requests changes, prioritize those fixes without broad redesign.",
 		...interactiveValidationGuidance(task, config),
 		"Implement the next necessary slice, verify it, then summarize:",
@@ -2758,6 +2898,10 @@ function updateHybridProgressDetails(
 	progress: HarnessProgress | undefined,
 ): void {
 	if (!progress) return;
+	const currentSlice =
+		progress.slices.find((slice) => slice.id === progress.currentSliceId) ??
+		progress.slices.find((slice) => slice.status === "in_progress") ??
+		progress.slices.find((slice) => slice.status === "pending");
 	details.progress = {
 		slicesDone: progress.slices.filter((slice) => slice.status === "done")
 			.length,
@@ -2769,6 +2913,10 @@ function updateHybridProgressDetails(
 		activeFrontierTriggers: progress.frontierRecheckTriggers.filter(
 			(trigger) => trigger.active,
 		).length,
+		currentSliceId: currentSlice?.id ?? progress.currentSliceId,
+		currentSliceTitle: currentSlice?.title,
+		currentSliceStatus: currentSlice?.status,
+		currentSliceRemaining: currentSlice?.remaining[0],
 		nextAction: progress.nextAction,
 	};
 }
@@ -3150,6 +3298,215 @@ function childActivity(child: HybridChildStats, now: number): string {
 	return facts.join(" · ") || "thinking…";
 }
 
+function childModelText(child: HybridChildStats): string | undefined {
+	if (!child.model) return undefined;
+	return `모델 ${child.model}`;
+}
+
+function ratioBar(done: number, total: number, width = 12): string {
+	const safeTotal = Math.max(0, total);
+	const safeDone = Math.max(0, Math.min(done, safeTotal));
+	if (safeTotal <= 0) return "░".repeat(width);
+	const filled = Math.round((safeDone / safeTotal) * width);
+	return `${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`;
+}
+
+function statusBadge(theme: any, label: string, tone: string): string {
+	return theme.fg(tone, `[ ${label} ]`);
+}
+
+function hybridStageLabelKo(stage: HybridRunStage | string | undefined): string {
+	const id = typeof stage === "string" ? stage : stage?.id;
+	const label = typeof stage === "string" ? stage : stage?.label;
+	switch (id) {
+		case "checkpoint":
+			return "사전 체크";
+		case "design":
+			return "저장소 조사 및 frontier 설계";
+		case "brief":
+			return "오케스트레이션 브리핑";
+		case "plan-review":
+			return "실행 계획 검증";
+		case "local-loop":
+			return "로컬 구현/테스트 루프";
+		case "finish":
+			return "결과 정리 및 검증";
+		case "local-review":
+			return "frontier 구현 리뷰";
+		case "frontier-final":
+			return "frontier 최종 게이트";
+		case "summary":
+			return "아티팩트 요약";
+		default:
+			return label ?? id ?? "알 수 없음";
+	}
+}
+
+function hybridStatusKo(status: HybridRunDetails["status"]): string {
+	if (status === "running") return "실행 중";
+	if (status === "failed") return "실패";
+	return "완료";
+}
+
+function hybridStageStatusKo(status: HybridStageStatus): string {
+	if (status === "running") return "진행 중";
+	if (status === "done") return "완료";
+	if (status === "failed") return "실패";
+	if (status === "skipped") return "건너뜀";
+	return "대기";
+}
+
+function hybridSliceStatusKo(status: SliceStatus | undefined): string {
+	if (status === "in_progress") return "구현 중";
+	if (status === "done") return "완료";
+	if (status === "blocked") return "차단";
+	return "대기";
+}
+
+function verdictLabelKo(verdict: string): string {
+	if (verdict === "FAIL") return "판정: FAIL";
+	if (verdict === "PASS_WITH_CONCERNS") return "판정: PASS_WITH_CONCERNS";
+	if (verdict === "PASS") return "판정: PASS";
+	return `판정: ${verdict}`;
+}
+
+function stageSummaryKo(summary: string | undefined): string {
+	if (!summary) return "";
+	const fields = Object.fromEntries(
+		summary
+			.split(";")
+			.map((part) => part.trim())
+			.filter(Boolean)
+			.map((part) => {
+				const [key, ...rest] = part.split("=");
+				return [key.trim(), rest.join("=").trim()];
+			})
+			.filter(([key, value]) => key && value),
+	);
+	const parts: string[] = [];
+	if (fields.verdict) parts.push(verdictLabelKo(fields.verdict));
+	if (fields.reason) parts.push(`이유: ${fields.reason}`);
+	if (fields.next) parts.push(`다음: ${fields.next}`);
+	if (fields.child) parts.push(`하위 실행: ${fields.child}`);
+	if (!parts.length) return summary;
+	return parts.join(" · ");
+}
+
+function koreanHybridRunOverviewLines(
+	details: HybridRunDetails,
+	theme: any,
+	now = Date.now(),
+): string[] {
+	const fg = (name: string, text: string) => theme.fg(name, text);
+	const lines: string[] = [];
+	const statusColor =
+		details.status === "failed"
+			? "error"
+			: details.status === "done"
+				? "success"
+				: "accent";
+	const runningStage = details.stages.find((stage) => stage.status === "running");
+	const lastDoneStage = [...details.stages].reverse().find((stage) => stage.status === "done");
+	const currentStage = runningStage ?? lastDoneStage ?? details.stages.find((stage) => stage.status !== "pending");
+	const currentChild = details.currentChild
+		? details.children[details.currentChild]
+		: Object.values(details.children).find((child) => child.status === "running");
+	const currentChildModel = currentChild ? childModelText(currentChild) : undefined;
+	const currentFacts = [
+		currentStage ? `${hybridStageLabelKo(currentStage)}(${hybridStageStatusKo(currentStage.status)})` : "",
+		currentChild
+			? `${currentChild.label}${currentChildModel ? ` · ${currentChildModel}` : ""} ${hybridStageStatusKo(currentChild.status)}`
+			: "",
+		details.currentTool ? `도구 ${details.currentTool}` : "",
+	].filter(Boolean);
+
+	lines.push(
+		`${fg("accent", "현재 상황")} ${statusBadge(theme, hybridStatusKo(details.status), statusColor)} ${statusBadge(theme, details.mode, "dim")}`,
+	);
+	lines.push(`${fg("dim", "작업")} ${truncateMiddle(details.task, 140)}`);
+	lines.push(
+		`${fg("dim", "현재 실행")} ${currentFacts.length ? currentFacts.join(" · ") : "대기 중"}`,
+	);
+	if (details.progress) {
+		const p = details.progress;
+		if (p.currentSliceId || p.currentSliceTitle) {
+			const sliceParts = [
+				p.currentSliceId,
+				p.currentSliceTitle,
+				hybridSliceStatusKo(p.currentSliceStatus),
+			].filter(Boolean);
+			const remaining = p.currentSliceRemaining
+				? ` · 남은 작업 ${truncateMiddle(p.currentSliceRemaining, 120)}`
+				: "";
+			lines.push(`${fg("dim", "현재 슬라이스")} ${sliceParts.join(" · ")}${remaining}`);
+		}
+		const progressParts = [
+			`조각 ${fg("success", ratioBar(p.slicesDone, p.slicesTotal))} ${p.slicesDone}/${p.slicesTotal}`,
+			`승인 기준 ${fg("success", ratioBar(p.acceptanceSatisfied, p.acceptanceTotal))} ${p.acceptanceSatisfied}/${p.acceptanceTotal}`,
+			`frontier 재확인 ${p.activeFrontierTriggers}`,
+		];
+		lines.push(`${fg("dim", "진행률")} ${progressParts.join(" · ")}`);
+		if (p.nextAction) {
+			lines.push(`${fg("dim", "다음 행동")} ${truncateMiddle(p.nextAction, 180)}`);
+		}
+	}
+	if (currentChild) {
+		lines.push(`${fg("dim", "최근 활동")} ${childActivity(currentChild, now)}`);
+	}
+	return lines;
+}
+
+function hybridStageFlowLine(details: HybridRunDetails, theme: any): string {
+	const parts = details.stages.map((stage) => {
+		const tone =
+			stage.status === "failed"
+				? "error"
+				: stage.status === "running"
+					? "accent"
+					: stage.status === "done"
+						? "success"
+						: "dim";
+		const summary = stageSummaryKo(stage.summary);
+		return `${theme.fg(tone, hybridStageIcon(stage.status))} ${hybridStageLabelKo(stage)}${summary ? ` (${summary})` : ""}`;
+	});
+	return `${theme.fg("accent", "단계 흐름")} ${parts.join("  ")}`;
+}
+
+function compactHybridLiveOutput(lines: string[]): string[] {
+	const compacted: string[] = [];
+	let inProgress = false;
+	const seenProgress = new Set<string>();
+	for (const raw of lines) {
+		const line = raw.trim();
+		if (line === "# Hybrid Progress") {
+			inProgress = true;
+			if (!seenProgress.has("progress-start")) {
+				compacted.push("progress.md 갱신됨");
+				seenProgress.add("progress-start");
+			}
+			continue;
+		}
+		if (inProgress) {
+			if (/^#\s+/.test(line) && line !== "# Hybrid Progress") {
+				inProgress = false;
+			} else {
+				const keep = line.match(/^- (현재 단계|완료된 조각|충족된 승인 기준|다음 행동|차단 사유):\s*(.+)$/);
+				if (keep?.[1] && keep[2]) {
+					const summary = `progress: ${keep[1]} ${keep[2]}`;
+					if (!seenProgress.has(summary)) {
+						compacted.push(summary);
+						seenProgress.add(summary);
+					}
+				}
+				continue;
+			}
+		}
+		if (!line) continue;
+		compacted.push(raw);
+	}
+	return compacted;
+}
+
 function cloneHybridDetails(details: HybridRunDetails): HybridRunDetails {
 	return {
 		...details,
@@ -3260,6 +3617,7 @@ function normalizeHybridChild(
 	const now = nowIso();
 	return {
 		label: String(child.label || label),
+		model: typeof child.model === "string" ? child.model : undefined,
 		status:
 			child.status === "done" || child.status === "failed"
 				? child.status
@@ -3360,9 +3718,14 @@ function createHybridReporter(
 				details.children[label] = child;
 				details.childOrder.push(label);
 			}
+			if (typeof event.model === "string" && event.model.trim()) {
+				child.model = event.model.trim();
+			}
 			child.updatedAt = timestamp;
 			details.currentChild = label;
-			if (event.type === "tool_execution_start") {
+			if (event.type === "child_start") {
+				child.status = "running";
+			} else if (event.type === "tool_execution_start") {
 				child.currentTool = event.toolName;
 				child.currentToolStartedAt = timestamp;
 				details.currentTool = event.toolName;
@@ -3497,37 +3860,11 @@ function buildHybridRunContainer(
 	);
 	c.addChild(new Spacer(1));
 
-	// Task preview
-	const taskPreviewLimit = Math.max(20, w - 8);
-	const taskPreview = expanded || details.task.length <= taskPreviewLimit
-		? details.task
-		: `${details.task.slice(0, taskPreviewLimit)}…`;
-	c.addChild(new Text(fit(theme.fg("dim", `Task: ${taskPreview}`)), 0, 0));
+	for (const line of koreanHybridRunOverviewLines(details, theme, now)) {
+		c.addChild(new Text(fit(line), 0, 0));
+	}
+	c.addChild(new Text(fit(hybridStageFlowLine(details, theme)), 0, 0));
 	c.addChild(new Spacer(1));
-
-	// Progress summary (slices / AC / triggers)
-	if (details.progress) {
-		const p = details.progress;
-		const progressParts: string[] = [];
-		progressParts.push(`slices ${p.slicesDone}/${p.slicesTotal}`);
-		progressParts.push(`AC ${p.acceptanceSatisfied}/${p.acceptanceTotal}`);
-		if (p.activeFrontierTriggers > 0) {
-			progressParts.push(`${p.activeFrontierTriggers} active trigger${p.activeFrontierTriggers > 1 ? "s" : ""}`);
-		}
-		c.addChild(new Text(fit(theme.fg("dim", `Progress: ${statJoin(theme, progressParts)}`)), 0, 0));
-		if (p.nextAction && expanded) {
-			c.addChild(new Text(fit(theme.fg("dim", `Next: ${truncateMiddle(p.nextAction, 200)}`)), 0, 0));
-		}
-		c.addChild(new Spacer(1));
-	}
-
-	// Current activity
-	if (isRunning && (details.currentChild || details.currentTool)) {
-		const facts: string[] = [];
-		if (details.currentChild) facts.push(details.currentChild);
-		if (details.currentTool) facts.push(details.currentTool);
-		c.addChild(new Text(fit(theme.fg("dim", `Current: ${facts.join(" · ")}`)), 0, 0));
-	}
 
 	const tokenRoutingLines = formatTokenRoutingLines(theme, details);
 	if (tokenRoutingLines.length > 0) {
@@ -3540,12 +3877,13 @@ function buildHybridRunContainer(
 	// Stage list
 	const runningStageSeed = hybridRunningSeed(details);
 	let stageIdx = 0;
+	c.addChild(new Text(fit(theme.fg("accent", themeBold(theme, "단계 흐름"))), 0, 0));
 	for (const stage of details.stages) {
 		const icon = stageIcon(stage.status, theme, stageIdx === 0 && isRunning ? runningStageSeed : undefined);
 		const suffix = stage.summary
 			? ` — ${truncateMiddle(stage.summary, expanded ? 240 : 120)}`
 			: "";
-		c.addChild(new Text(fit(`${icon} ${themeBold(theme, stage.label)}${suffix}`), 0, 0));
+		c.addChild(new Text(fit(`${icon} ${themeBold(theme, hybridStageLabelKo(stage))}${suffix}`), 0, 0));
 		stageIdx++;
 	}
 
@@ -3584,7 +3922,8 @@ function buildHybridRunContainer(
 			parts.push(formatTokenStat(tokenTotal, childHasEstimatedTokens(child)));
 			parts.push(dur);
 
-			const header = `${cs} ${themeBold(theme, child.label)} · ${statJoin(theme, parts)}`;
+			const model = childModelText(child);
+			const header = `${cs} ${themeBold(theme, child.label)}${model ? ` · ${theme.fg("dim", model)}` : ""} · ${statJoin(theme, parts)}`;
 			c.addChild(new Text(fit(header), 0, 0));
 
 			if (expanded && child.lastOutput) {
@@ -3719,8 +4058,9 @@ function hybridDetailsToMarkdown(
 			const tool = child.currentTool
 				? ` · ${child.currentTool}${currentToolDuration}`
 				: "";
+			const model = childModelText(child) ? ` · ${childModelText(child)}` : "";
 			lines.push(
-				`${status} ${child.label}${tool} · ${child.toolCalls} tools · ${formatApproxTokenCount(tokenTotal, childHasEstimatedTokens(child))} tok · ${duration}`,
+				`${status} ${child.label}${model}${tool} · ${child.toolCalls} tools · ${formatApproxTokenCount(tokenTotal, childHasEstimatedTokens(child))} tok · ${duration}`,
 			);
 			if (expanded && child.lastOutput)
 				lines.push(`  ⎿ ${truncateMiddle(child.lastOutput, 220)}`);
@@ -3795,22 +4135,56 @@ function hybridModelDescription(model: {
 	return parts.filter(Boolean).join(" · ");
 }
 
+type HybridGateAction =
+	| { kind: "answer"; text: string }
+	| { kind: "edit" }
+	| { kind: "run" }
+	| { kind: "grill" }
+	| { kind: "close" };
+
+interface HybridGateChoice {
+	label: string;
+	value: string;
+	description?: string;
+	marker?: string;
+}
+
+interface HybridReportOverlayOptions {
+	choices?: HybridGateChoice[];
+	ready?: boolean;
+	allowGrill?: boolean;
+	showEditChoice?: boolean;
+	editLabel?: string;
+	editDescription?: string;
+	runLabel?: string;
+	runDescription?: string;
+	pickerTitle?: string;
+}
+
 class HybridReportOverlayComponent implements Component {
 	private scrollOffset = Number.MAX_SAFE_INTEGER;
 	private cachedWidth = -1;
 	private cachedLines: string[] = [];
+	private selectList?: SelectList;
+	private readonly gateItems: SelectItem[];
+	private selectedGateIndex = 0;
 
 	constructor(
 		private readonly tui: TUI,
 		private readonly title: string,
 		private readonly markdown: string,
 		private readonly theme: any,
-		private readonly done: () => void,
-	) {}
+		private readonly done: (result?: HybridGateAction) => void,
+		private readonly options: HybridReportOverlayOptions = {},
+	) {
+		this.gateItems = this.buildGateItems();
+		this.selectList = this.gateItems.length ? this.makeSelectList() : undefined;
+	}
 
 	invalidate(): void {
 		this.cachedWidth = -1;
 		this.cachedLines = [];
+		this.selectList?.invalidate();
 	}
 
 	handleInput(data: string): void {
@@ -3821,7 +4195,55 @@ class HybridReportOverlayComponent implements Component {
 			data === "q" ||
 			data === "Q"
 		) {
-			this.done();
+			this.done({ kind: "close" });
+			return;
+		}
+		if (data === "e" || data === "E") {
+			this.done({ kind: "edit" });
+			return;
+		}
+		if (this.options.ready && (data === "r" || data === "R")) {
+			this.done({ kind: "run" });
+			return;
+		}
+		if (
+			this.options.ready &&
+			this.options.allowGrill &&
+			(data === "g" || data === "G")
+		) {
+			this.done({ kind: "grill" });
+			return;
+		}
+		const numeric = Number.parseInt(data, 10);
+		if (
+			Number.isInteger(numeric) &&
+			numeric >= 1 &&
+			numeric <= this.gateItems.length
+		) {
+			this.selectGateItem(this.gateItems[numeric - 1]);
+			return;
+		}
+		const alphaIndex = data.length === 1
+			? data.toUpperCase().charCodeAt(0) - "A".charCodeAt(0)
+			: -1;
+		if (
+			alphaIndex >= 0 &&
+			alphaIndex < (this.options.choices?.length ?? 0)
+		) {
+			this.selectGateItem(this.gateItems[alphaIndex]);
+			return;
+		}
+		if (this.gateItems.length && matchesKey(data, Key.enter)) {
+			this.selectGateItem(this.gateItems[this.selectedGateIndex]);
+			this.tui.requestRender();
+			return;
+		}
+		if (this.gateItems.length && (
+			matchesKey(data, Key.left) ||
+			matchesKey(data, Key.right)
+		)) {
+			this.moveGateSelection(matchesKey(data, Key.left) ? -1 : 1);
+			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, Key.up) || data === "k" || data === "K") {
@@ -3840,11 +4262,99 @@ class HybridReportOverlayComponent implements Component {
 		this.tui.requestRender();
 	}
 
+	private buildGateItems(): SelectItem[] {
+		const items: SelectItem[] = [];
+		for (const [index, choice] of (this.options.choices ?? []).entries()) {
+			const marker = choice.marker ?? String(index + 1);
+			items.push({
+				value: `answer:${choice.value}`,
+				label: `${marker}. ${choice.label}`,
+				description: choice.description,
+			});
+		}
+		if (this.options.showEditChoice) {
+			items.push({
+				value: "edit",
+				label: this.options.editLabel ?? "e. 직접 입력",
+				description:
+					this.options.editDescription ?? "선택지와 다른 내용을 직접 입력합니다.",
+			});
+		}
+		if (this.options.ready) {
+			items.push({
+				value: "run",
+				label: this.options.runLabel ?? "r. 이 내용으로 run 실행",
+				description:
+					this.options.runDescription ??
+					"현재 확정 내용을 승인하고 /hybrid-run을 시작합니다.",
+			});
+			if (this.options.allowGrill) {
+				items.push({
+					value: "grill",
+					label: "g. 그래도 grill로 설계 검토 먼저",
+					description: "구현 전에 /hybrid-grill로 리스크와 설계를 압박 검토합니다.",
+				});
+			}
+		}
+		return items;
+	}
+
+	private makeSelectList(): SelectList {
+		const list = new SelectList(this.gateItems, Math.min(this.gateItems.length, 8), {
+			selectedPrefix: (text) => this.theme.fg("accent", text),
+			selectedText: (text) => this.theme.fg("accent", text),
+			description: (text) => this.theme.fg("muted", text),
+			scrollInfo: (text) => this.theme.fg("dim", text),
+			noMatch: (text) => this.theme.fg("warning", text),
+		});
+		list.onSelect = (item) => this.selectGateItem(item);
+		list.onCancel = () => this.done({ kind: "close" });
+		return list;
+	}
+
+	private moveGateSelection(delta: number): void {
+		if (!this.gateItems.length) return;
+		this.selectedGateIndex =
+			(this.selectedGateIndex + delta + this.gateItems.length) %
+			this.gateItems.length;
+		this.selectList?.setSelectedIndex(this.selectedGateIndex);
+	}
+
+	private selectGateItem(item: SelectItem): void {
+		if (item.value === "edit") {
+			this.done({ kind: "edit" });
+			return;
+		}
+		if (item.value === "run") {
+			this.done({ kind: "run" });
+			return;
+		}
+		if (item.value === "grill") {
+			this.done({ kind: "grill" });
+			return;
+		}
+		if (item.value.startsWith("answer:")) {
+			this.done({ kind: "answer", text: item.value.slice("answer:".length) });
+		}
+	}
+
+	private renderGateItem(item: SelectItem, index: number, width: number): string {
+		const selected = index === this.selectedGateIndex;
+		const prefix = selected ? "▶ " : "  ";
+		const text = `${prefix}${item.label}${item.description ? ` — ${item.description}` : ""}`;
+		const styled = selected ? this.theme.fg("accent", text) : text;
+		return truncateToWidth(normalizeTuiText(styled), width, "…", true);
+	}
+
 	render(width: number): string[] {
 		const panelWidth = Math.max(60, Math.min(width, 120));
 		const innerW = panelWidth - 2;
 		const bodyW = Math.max(20, innerW - 2);
-		const bodyHeight = 28;
+		const pickerLinesHeight = this.selectList
+			? Math.min(this.gateItems.length, 8) + (this.gateItems.length > 8 ? 1 : 0)
+			: 0;
+		const pickerHeight = this.selectList ? pickerLinesHeight + 2 : 0;
+		const bodyHeight = Math.max(14, 28 - pickerHeight);
 		const th = this.theme;
 		const lines: string[] = [];
 		const row = (content = "") =>
@@ -3867,15 +4377,327 @@ class HybridReportOverlayComponent implements Component {
 		lines.push(row(` ${th.fg("accent", themeBold(th, this.title))}`));
 		lines.push(th.fg("border", `├${"─".repeat(innerW)}┤`));
 		for (const line of visible) lines.push(row(` ${line}`));
-		for (let i = visible.length; i < Math.min(bodyHeight, 6); i++)
+		for (let i = visible.length; i < bodyHeight; i++)
 			lines.push(row(""));
 		lines.push(th.fg("border", `├${"─".repeat(innerW)}┤`));
+		if (this.selectList) {
+			const pickerTitle = this.options.pickerTitle ?? (this.options.ready
+				? " 선택하세요: run 실행 / grill 먼저 / 직접 입력"
+				: " 선택지를 고르거나 e로 직접 입력하세요");
+			lines.push(row(th.fg("dim", pickerTitle)));
+			const pickerStart = Math.min(
+				Math.max(0, this.selectedGateIndex - pickerLinesHeight + 1),
+				Math.max(0, this.gateItems.length - pickerLinesHeight),
+			);
+			for (let i = 0; i < pickerLinesHeight; i++)
+				lines.push(
+					row(` ${this.gateItems[pickerStart + i] ? this.renderGateItem(this.gateItems[pickerStart + i], pickerStart + i, bodyW) : ""}`),
+				);
+			lines.push(th.fg("border", `├${"─".repeat(innerW)}┤`));
+		}
 		const scroll = this.cachedLines.length > bodyHeight
 			? ` ${start + 1}-${end}/${this.cachedLines.length}`
 			: "";
-		lines.push(row(` ${th.fg("dim", `↑↓/j/k scroll · PgUp/PgDn · F8/q/Esc close${scroll}`)}`));
+		const actionHint = this.options.ready
+			? `↑↓/j/k scroll · ←/→ picker · Enter 선택 · r run${this.options.allowGrill ? " · g grill" : ""} · e 직접 입력 · q/Esc 닫기${scroll}`
+			: `↑↓/j/k scroll · Enter/A/B/C/숫자 선택 · ←/→ picker · e 직접 입력 · q/Esc 닫기${scroll}`;
+		lines.push(row(` ${th.fg("dim", actionHint)}`));
 		lines.push(th.fg("border", `╰${"─".repeat(innerW)}╯`));
 		return lines;
+	}
+}
+
+class HybridGateLoadingOverlayComponent implements Component {
+	private closed = false;
+	private frameIndex = 0;
+	private readonly frames = ["-", "\\", "|", "/"];
+	private readonly timer: ReturnType<typeof setInterval>;
+
+	constructor(
+		private readonly tui: TUI,
+		private readonly title: string,
+		private readonly message: string,
+		private readonly detail: string,
+		private readonly theme: any,
+		private readonly done: () => void,
+	) {
+		this.timer = setInterval(() => {
+			this.frameIndex = (this.frameIndex + 1) % this.frames.length;
+			this.tui.requestRender();
+		}, 120);
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		clearInterval(this.timer);
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.dispose();
+		this.done();
+	}
+
+	handleInput(_data: string): void {}
+
+	render(width: number): string[] {
+		const panelWidth = Math.max(60, Math.min(width, 96));
+		const innerW = panelWidth - 2;
+		const th = this.theme;
+		const row = (content = "") =>
+			`${th.fg("border", "│")}${truncateToWidth(normalizeTuiText(content), innerW, "…", true)}${th.fg("border", "│")}`;
+		const frame = this.frames[this.frameIndex] ?? "-";
+		return [
+			th.fg("border", `╭${"─".repeat(innerW)}╮`),
+			row(` ${th.fg("accent", themeBold(th, this.title))}`),
+			th.fg("border", `├${"─".repeat(innerW)}┤`),
+			row(` ${th.fg("accent", frame)} ${this.message}`),
+			row(` ${th.fg("dim", this.detail)}`),
+			row(` ${th.fg("dim", "완료되면 다음 모달이 열립니다.")}`),
+			th.fg("border", `╰${"─".repeat(innerW)}╯`),
+		];
+	}
+}
+
+function stripHybridArtifactFooter(text: string): string {
+	return text.split(/^## stderr\s*$/m)[0] ?? text;
+}
+
+function cleanHybridChoiceText(text: string): string {
+	return text
+		.replace(/\*\*/g, "")
+		.replace(/`/g, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/[.;。]\s*$/, "");
+}
+
+function extractHybridGateChoices(markdown: string): HybridGateChoice[] {
+	const lines = stripHybridArtifactFooter(markdown).split("\n");
+	const choices: HybridGateChoice[] = [];
+	let inChoiceSection = false;
+	let choiceContextLines = 0;
+	let recommended: string | undefined;
+	const seen = new Set<string>();
+	const push = (value: string, label = value, description?: string, marker?: string) => {
+		const cleanValue = cleanHybridChoiceText(value);
+		if (!cleanValue || cleanValue.length < 2 || seen.has(cleanValue)) return;
+		seen.add(cleanValue);
+		choices.push({
+			value: cleanValue,
+			label: cleanHybridChoiceText(label).slice(0, 110),
+			description,
+			marker,
+		});
+	};
+	for (const rawLine of lines) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (/^(#{1,6}\s*)?(choices?|options?|선택지|답변\s*선택지|후보\s*답변|recommended answer|추천\s*답변|권장\s*답변)\b/i.test(line)) {
+			inChoiceSection = true;
+			choiceContextLines = 6;
+			const afterColon = line.split(/[:：]/).slice(1).join(":").trim();
+			if (afterColon) {
+				recommended = afterColon;
+				push(afterColon, `${afterColon} (recommended)`, "추천 답변");
+			}
+			continue;
+		}
+		const recommendedMatch = line.match(/^(?:[-*]\s*)?(?:recommended answer|추천\s*답변|권장\s*답변)\s*[:：]\s*(.+)$/i);
+		if (recommendedMatch?.[1]) {
+			recommended = recommendedMatch[1];
+			push(recommended, `${recommended} (recommended)`, "추천 답변");
+			inChoiceSection = true;
+			choiceContextLines = 6;
+			continue;
+		}
+		if (/(next question|choose|select|answer with|recommended|다음\s*질문|고르|선택|답변|추천|확정할까요|할까요)/i.test(line)) {
+			choiceContextLines = 6;
+		}
+		const choiceMatch = line.match(/^(?:[-*]\s*)?(?:(?:option|choice)\s*)?([0-9]{1,2}|[A-Ca-c]|[가-다])[\.)、:：]\s+(.+)$/i);
+		const bulletChoiceMatch = inChoiceSection
+			? line.match(/^[-*]\s+(.+)$/)
+			: undefined;
+		const optionPrefixed = /^(?:[-*]\s*)?(?:option|choice)\s+/i.test(line);
+		const marker = choiceMatch?.[1];
+		const markerIndex = marker && /^[A-Ca-c]$/.test(marker)
+			? marker.toUpperCase().charCodeAt(0) - "A".charCodeAt(0)
+			: -1;
+		const value =
+			(choiceMatch && (inChoiceSection || choiceContextLines > 0 || optionPrefixed || markerIndex >= 0)
+				? choiceMatch[2]
+				: undefined) ?? bulletChoiceMatch?.[1];
+		if (value) {
+			const suffix = recommended && cleanHybridChoiceText(value) === cleanHybridChoiceText(recommended)
+				? " (recommended)"
+				: "";
+			push(value, `${value}${suffix}`, undefined, marker);
+		} else if (inChoiceSection && /^#{1,6}\s+/.test(line)) {
+			inChoiceSection = false;
+		}
+		if (choiceContextLines > 0) choiceContextLines--;
+		if (choices.length >= 6) break;
+	}
+	return choices;
+}
+
+function extractHybridInterviewAnswerDraft(text: string): string {
+	const answerMatch = /^## Answer\s*$/m.exec(text);
+	if (!answerMatch) return text.trim();
+	const start = answerMatch.index + answerMatch[0].length;
+	const rest = text.slice(start);
+	const referenceMatch = /^## Current interview\s*$/m.exec(rest);
+	const answer = referenceMatch ? rest.slice(0, referenceMatch.index) : rest;
+	return answer.trim();
+}
+
+function frontierGateReadyForHybridRun(
+	kind: "interview" | "grill",
+	text: string,
+): boolean {
+	const lower = text.toLowerCase();
+	if (!text.trim() || lower.includes("(no output)")) return false;
+	if (kind === "interview") {
+		const hasHandoff =
+			lower.includes("implementation-ready") ||
+			(lower.includes("source request") &&
+				lower.includes("desired outcome") &&
+				lower.includes("acceptance criteria") &&
+				lower.includes("verification contracts"));
+		return hasHandoff;
+	}
+	const waitingForAnswer =
+		lower.includes("next question") ||
+		lower.includes("ask exactly one") ||
+		text.includes("다음 질문") ||
+		text.includes("답변해");
+	return !waitingForAnswer;
+}
+
+function hybridGateApprovalSummaryKo(
+	kind: "interview" | "grill",
+	report: string,
+): string {
+	const body = stripHybridArtifactFooter(report)
+		.split("\n")
+		.filter((line) => !/^- (model|thinking|ok|exitCode|usage):/i.test(line.trim()))
+		.join("\n")
+		.trim();
+	const title = kind === "interview"
+		? "Interview 결과: 구현에 들어갈 수 있는 수준입니다"
+		: "Grill 결과: 이 내용으로 구현에 들어갈 수 있는 수준입니다";
+	const action = kind === "interview"
+		? "이대로 충분합니다. run 할까요? 그래도 grill을 먼저 할까요?"
+		: "이제 충분합니다. 이 내용으로 run 할까요?";
+	return [
+		`# ${title}`,
+		"",
+		"## 한국어 확인",
+		"",
+		"- 아래 내용은 현재까지 확정된 요구사항/설계 판단입니다.",
+		"- 자동으로 run을 시작하지 않습니다. 사용자가 승인 키를 눌러야 진행합니다.",
+		`- ${action}`,
+		"",
+		"## 현재까지 확정된 내용",
+		"",
+		truncateMiddle(body || report, 18_000),
+	].join("\n");
+}
+
+function extractHybridGateTask(report: string): string {
+	const body = stripHybridArtifactFooter(report);
+	const sourceRequest = body.match(
+		/^#{1,6}\s+Source Request\s*\n([\s\S]*?)(?=^#{1,6}\s+|\s*$)/im,
+	)?.[1];
+	const candidate =
+		sourceRequest
+			?.split("\n")
+			.map((line) => line.replace(/^[-*]\s*/, "").trim())
+			.find(Boolean) ??
+		body
+			.split("\n")
+			.map((line) => line.replace(/^#{1,6}\s*/, "").trim())
+			.find((line) => line && !/^[-*]\s*(model|thinking|ok|exitCode|usage):/i.test(line));
+	return truncateMiddle(candidate ?? "", 500).trim();
+}
+
+function ensureHybridGateTaskForRun(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	report: string,
+): string {
+	const taskArtifact = readArtifact(cwd, config, "task.md")
+		.replace(/^# Task\s*/i, "")
+		.trim();
+	const task = state.task?.trim() || taskArtifact || extractHybridGateTask(report);
+	if (!task) {
+		throw new Error(
+			"Hybrid gate is ready, but no task is recorded. Run /hybrid-interview or /hybrid-grill with the task text first.",
+		);
+	}
+	state.task = task;
+	if (!taskArtifact) {
+		writeArtifact(cwd, config, state, "task.md", `# Task\n\n${task}\n`);
+	}
+	saveState(cwd, config, state);
+	return task;
+}
+
+function showHybridGateLoading(
+	ctx: any,
+	title: string,
+	message: string,
+	detail: string,
+): (() => Promise<void>) | undefined {
+	if (!(ctx?.hasUI && ctx?.ui?.custom)) return undefined;
+	let closed = false;
+	let component: HybridGateLoadingOverlayComponent | undefined;
+	const overlay = ctx.ui.custom(
+		(tui: TUI, theme: any, _keybindings: unknown, done: () => void) => {
+			component = new HybridGateLoadingOverlayComponent(
+				tui,
+				title,
+				message,
+				detail,
+				theme,
+				done,
+			);
+			if (closed) queueMicrotask(() => component?.close());
+			return component;
+		},
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: "80%",
+				minWidth: 60,
+				maxHeight: "40%",
+			},
+		},
+	).catch(() => undefined);
+	return async () => {
+		if (closed) return;
+		closed = true;
+		component?.close();
+		await overlay;
+	};
+}
+
+async function runWithHybridGateLoading<T>(
+	ctx: any,
+	title: string,
+	message: string,
+	detail: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const closeLoading = showHybridGateLoading(ctx, title, message, detail);
+	try {
+		return await operation();
+	} finally {
+		await closeLoading?.();
 	}
 }
 
@@ -4281,6 +5103,7 @@ class HybridMonitorOverlayComponent implements Component {
 		const panelWidth = Math.max(60, Math.min(width, 120));
 		const innerW = panelWidth - 2;
 		const th = this.theme;
+		const now = Date.now();
 		const lines: string[] = [];
 		const row = (content = "") =>
 			`${th.fg("border", "│")}${truncateToWidth(normalizeTuiText(content), innerW, "…", true)}${th.fg("border", "│")}`;
@@ -4299,26 +5122,10 @@ class HybridMonitorOverlayComponent implements Component {
 			return lines;
 		}
 
-		const status =
-			details.status === "running"
-				? th.fg("accent", "running")
-				: details.status === "failed"
-					? th.fg("error", "failed")
-					: th.fg("success", "done");
-		const stats = formatProgressStats(th, details);
-		lines.push(row(` Status: ${status} ${th.fg("dim", `mode=${details.mode}`)}${stats ? ` ${stats}` : ""}`));
-		if (details.currentStage || details.currentChild || details.currentTool) {
-			const current = [
-				details.currentStage ? `stage=${details.currentStage}` : "",
-				details.currentChild ? `child=${details.currentChild}` : "",
-				details.currentTool ? `tool=${details.currentTool}` : "",
-			].filter(Boolean);
-			lines.push(row(` Current: ${th.fg("dim", current.join(" · "))}`));
+		for (const line of koreanHybridRunOverviewLines(details, th, now)) {
+			lines.push(row(` ${line}`));
 		}
-		if (details.progress) {
-			const p = details.progress;
-			lines.push(row(` Progress: ${th.fg("dim", `slices ${p.slicesDone}/${p.slicesTotal} · AC ${p.acceptanceSatisfied}/${p.acceptanceTotal} · triggers ${p.activeFrontierTriggers}`)}`));
-		}
+		lines.push(row(` ${hybridStageFlowLine(details, th)}`));
 		if (details.localVerdict || details.frontierVerdict) {
 			lines.push(row(` Verdicts: ${th.fg("dim", `local=${details.localVerdict ?? "pending"} · frontier=${details.frontierVerdict ?? "pending"}`)}`));
 		}
@@ -4329,8 +5136,9 @@ class HybridMonitorOverlayComponent implements Component {
 
 		const liveOutput = details.liveOutput ?? [];
 		const rawLog = liveOutput.length > 0 ? liveOutput : details.recentOutput;
+		const compactLog = compactHybridLiveOutput(rawLog);
 		const bodyWidth = Math.max(20, innerW - 2);
-		const bodyLines = rawLog.flatMap((line) =>
+		const bodyLines = compactLog.flatMap((line) =>
 			wrapTextWithAnsi(normalizeTuiText(line), bodyWidth).map((wrapped) => ` ${wrapped}`),
 		);
 		const bodyHeight = 24;
@@ -4346,13 +5154,19 @@ class HybridMonitorOverlayComponent implements Component {
 		const start = Math.max(0, end - bodyHeight);
 		const visibleBody = bodyLines.slice(start, end);
 
+		lines.push(row(` ${th.fg("accent", themeBold(th, "실시간 로그"))} ${th.fg("dim", "최근 이벤트만 압축 표시")}`));
+		let bodyRowsWritten = 0;
 		if (visibleBody.length === 0) {
-			lines.push(row(` ${th.fg("dim", "No child output yet.")}`));
+			lines.push(row(` ${th.fg("dim", "아직 표시할 하위 작업 출력이 없습니다.")}`));
+			bodyRowsWritten = 1;
 		} else {
-			for (const line of visibleBody) lines.push(row(line));
+			for (const line of visibleBody) {
+				lines.push(row(line));
+				bodyRowsWritten++;
+			}
 		}
 
-		for (let i = visibleBody.length; i < Math.min(bodyHeight, 6); i++) {
+		for (let i = bodyRowsWritten; i < bodyHeight; i++) {
 			lines.push(row(""));
 		}
 
@@ -4362,9 +5176,9 @@ class HybridMonitorOverlayComponent implements Component {
 			? th.fg("dim", ` ${start + 1}-${end}/${bodyLines.length}`)
 			: "";
 		const cancelHint = this.cancelArmed
-			? th.fg("warning", " Press x again to cancel active run")
-			: th.fg("dim", " · x/Ctrl-C cancel");
-		lines.push(row(` ${follow}${scroll} ${th.fg("dim", "↑↓/j/k scroll · PgUp/PgDn · f follow · F8/q/Esc close")}${cancelHint}`));
+			? th.fg("warning", " 실행 취소하려면 x를 한 번 더 누르세요")
+			: th.fg("dim", " · x/Ctrl-C 취소");
+		lines.push(row(` ${follow}${scroll} ${th.fg("dim", "↑↓/j/k 스크롤 · PgUp/PgDn · f 따라가기 · F8/q/Esc 닫기")}${cancelHint}`));
 		lines.push(th.fg("border", `╰${"─".repeat(innerW)}╯`));
 		return lines;
 	}
@@ -4417,6 +5231,57 @@ function parseLocalVerdict(
 	return "UNKNOWN";
 }
 
+function summaryValue(text: string | undefined, max = 140): string | undefined {
+	const normalized = text?.replace(/\s+/g, " ").replace(/;/g, ",").trim();
+	return normalized ? truncateMiddle(normalized, max) : undefined;
+}
+
+function firstSummaryItem(value: unknown): string | undefined {
+	if (Array.isArray(value)) {
+		return value.find((item) => typeof item === "string" && item.trim());
+	}
+	return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function localReviewSummary(
+	verdict: ReturnType<typeof parseLocalVerdict>,
+	text: string,
+): string {
+	const json = extractJsonObject<{
+		highRiskResidualBlockers?: unknown;
+		blockingIssues?: unknown;
+		missingEvidence?: unknown;
+		nonBlockingConcerns?: unknown;
+		nextAction?: unknown;
+	}>(text);
+	const policyFailure = text.match(/FAIL:\s*([^\n]+)/i)?.[1];
+	const reason =
+		firstSummaryItem(json?.highRiskResidualBlockers) ??
+		firstSummaryItem(json?.blockingIssues) ??
+		firstSummaryItem(json?.missingEvidence) ??
+		(verdict === "PASS_WITH_CONCERNS"
+			? firstSummaryItem(json?.nonBlockingConcerns)
+			: undefined) ??
+		policyFailure ??
+		(verdict === "FAIL"
+			? "frontier 구현 리뷰가 수정 필요로 판정"
+			: verdict === "PASS_WITH_CONCERNS"
+				? "통과했지만 남은 우려가 있음"
+				: verdict === "PASS"
+					? "검토 통과"
+					: "리뷰 판정 확인 필요");
+	const next =
+		typeof json?.nextAction === "string" && json.nextAction.trim()
+			? json.nextAction
+			: undefined;
+	const parts = [`verdict=${verdict}`];
+	const conciseReason = summaryValue(reason);
+	const conciseNext = summaryValue(next);
+	if (conciseReason) parts.push(`reason=${conciseReason}`);
+	if (conciseNext) parts.push(`next=${conciseNext}`);
+	return parts.join("; ");
+}
+
 function parseFrontierVerdict(
 	text: string,
 ): "APPROVE" | "REQUEST_CHANGES" | "ESCALATE_TO_USER" | "UNKNOWN" {
@@ -4435,6 +5300,45 @@ function parseFrontierVerdict(
 	return "UNKNOWN";
 }
 
+function stringifyBriefItem(value: unknown): string {
+	if (typeof value === "string") return value.trim();
+	if (value === undefined || value === null) return "";
+	if (typeof value !== "object") return String(value).trim();
+	const record = value as Record<string, unknown>;
+	const main = [
+		record.question,
+		record.prompt,
+		record.text,
+		record.title,
+		record.summary,
+	].find((part) => typeof part === "string" && part.trim());
+	const recommended = [
+		record.recommendedAnswer,
+		record.recommended,
+		record.suggestedAnswer,
+		record.default,
+	].find((part) => typeof part === "string" && part.trim());
+	const rawOptions = Array.isArray(record.options)
+		? record.options
+		: Array.isArray(record.choices)
+			? record.choices
+			: [];
+	const options = rawOptions.map(stringifyBriefItem).filter(Boolean);
+	const parts = [
+		typeof main === "string" ? main.trim() : undefined,
+		typeof recommended === "string"
+			? `추천: ${recommended.trim()}`
+			: undefined,
+		options.length ? `선택지: ${options.join(" / ")}` : undefined,
+	].filter(Boolean);
+	if (parts.length) return parts.join(" · ");
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return String(value).trim();
+	}
+}
+
 function normalizeBrief(
 	value: Partial<OrchestrationBrief> | undefined,
 ): OrchestrationBrief {
@@ -4444,16 +5348,16 @@ function normalizeBrief(
 				"Proceed with the frontier design package and structured progress plan.",
 		),
 		executionStrategy: Array.isArray(value?.executionStrategy)
-			? value.executionStrategy.map(String).filter(Boolean)
+			? value.executionStrategy.map(stringifyBriefItem).filter(Boolean)
 			: [],
 		assumptions: Array.isArray(value?.assumptions)
-			? value.assumptions.map(String).filter(Boolean)
+			? value.assumptions.map(stringifyBriefItem).filter(Boolean)
 			: [],
 		ambiguities: Array.isArray(value?.ambiguities)
-			? value.ambiguities.map(String).filter(Boolean)
+			? value.ambiguities.map(stringifyBriefItem).filter(Boolean)
 			: [],
 		blockingQuestions: Array.isArray(value?.blockingQuestions)
-			? value.blockingQuestions.map(String).filter(Boolean)
+			? value.blockingQuestions.map(stringifyBriefItem).filter(Boolean)
 			: [],
 		taskRisk:
 			value?.taskRisk === "high" ||
@@ -4492,6 +5396,72 @@ function briefToMarkdown(brief: OrchestrationBrief): string {
 		...section("Ambiguities", brief.ambiguities),
 		...section("Blocking questions", brief.blockingQuestions),
 	].join("\n");
+}
+
+function clarificationGateMarkdown(brief: OrchestrationBrief): string {
+	return [
+		"# 실행 전 확인 필요",
+		"",
+		"오케스트레이션 브리프가 구현 결과를 바꿀 수 있는 결정을 찾았습니다.",
+		"",
+		`- 위험도: ${brief.taskRisk}`,
+		`- 권장 동작: ${brief.recommendedAction}`,
+		"",
+		"## 확인할 질문",
+		"",
+		...brief.blockingQuestions.map((q, i) => `${i + 1}. ${q}`),
+		"",
+		"## 현재 계획 요약",
+		"",
+		brief.planSummary,
+		"",
+		"## 진행 방식",
+		"",
+		"- `e` 또는 Enter: 답변/진행 프롬프트 입력",
+		"- `r`: 답변 없이 계속 진행",
+	].join("\n");
+}
+
+async function showHybridClarificationGate(
+	ctx: any,
+	brief: OrchestrationBrief,
+): Promise<HybridGateAction> {
+	if (!(ctx?.hasUI && ctx?.ui?.custom)) return { kind: "edit" };
+	return await ctx.ui.custom(
+		(
+			tui: TUI,
+			theme: any,
+			_keybindings: unknown,
+			done: (result: HybridGateAction) => void,
+		) =>
+			new HybridReportOverlayComponent(
+				tui,
+				"Hybrid Clarification",
+				clarificationGateMarkdown(brief),
+				theme,
+				done,
+				{
+					showEditChoice: true,
+					ready: true,
+					editLabel: "e. 답변/진행 프롬프트 입력",
+					editDescription:
+						"질문에 답하거나 구현 진행 방향을 직접 지시합니다.",
+					runLabel: "r. 답변 없이 계속 진행",
+					runDescription: "현재 설계와 기본 가정대로 구현을 계속합니다.",
+					pickerTitle:
+						" 실행 전 확인: 답변을 입력하거나 현재 설계대로 진행하세요",
+				},
+			),
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: "90%",
+				minWidth: 70,
+				maxHeight: "80%",
+			},
+		},
+	);
 }
 
 function readOrchestrationBriefArtifact(
@@ -4539,6 +5509,7 @@ async function createOrchestrationBrief(
 	);
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "brief");
+	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
 		"You are the LOCAL ORCHESTRATOR for a hybrid coding harness.",
 		"Brief the user/parent before implementation. Do not modify files.",
@@ -4549,7 +5520,9 @@ async function createOrchestrationBrief(
 		"",
 		`Task: ${task}`,
 		...(steering ? ["", steering] : []),
+		...requirementsContext,
 		"Read these artifacts:",
+		`- ${config.stateDir}/requirements.md if present`,
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/repo-map.md`,
 		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
@@ -4689,17 +5662,21 @@ async function runPlanReview(
 ): Promise<{ review: PlanReview; result: PiRunResult }> {
 	notify?.("Hybrid plan review: validating serious-task execution plan...", "info");
 	const progress = readProgress(cwd, config, task);
+	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
 		"You are the FRONTIER PLAN REVIEWER for a hybrid coding harness.",
 		"This gate is CWS-compatible and not CWS-dependent: use the rubric names below, but do not assume Codex native subagents exist.",
 		"Do not modify files. Decide whether local implementation may start.",
 		"",
 		`Task: ${task}`,
+		...requirementsContext,
 		"",
 		"Read these artifacts and compare them against the current progress snapshot:",
+		`- ${config.stateDir}/requirements.md if present`,
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/implementation-plan.json`,
 		`- ${config.stateDir}/orchestration-brief.md`,
+		`- ${config.stateDir}/user-clarifications.md if present`,
 		`- ${config.stateDir}/repo-map.md`,
 		`- ${config.stateDir}/progress.json`,
 		`- ${config.stateDir}/progress.md`,
@@ -4769,14 +5746,17 @@ async function createProgressFromDesign(
 	);
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "progress-plan");
+	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
 		"You are the LOCAL CONTROL-PLANE PLANNER for a hybrid coding harness.",
 		"Convert the frontier design package into strict JSON progress state. Do not modify files.",
 		"",
 		`Task: ${task}`,
 		...(steering ? ["", steering] : []),
+		...requirementsContext,
 		"",
 		"Read these artifacts:",
+		`- ${config.stateDir}/requirements.md if present`,
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/repo-map.md`,
 		"",
@@ -5074,6 +6054,9 @@ async function runFrontierInterview(
 		requestOrAnswer ||
 		"(task missing)";
 	if (!state.task && requestOrAnswer) state.task = requestOrAnswer;
+	if (state.task && !readArtifact(cwd, config, "task.md").trim()) {
+		writeArtifact(cwd, config, state, "task.md", `# Task\n\n${state.task}\n`);
+	}
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "frontier-interview");
 	notify?.("Hybrid interview: frontier requirements gate running...", "info");
@@ -5163,6 +6146,9 @@ async function runFrontierGrill(
 		planOrDesign ||
 		"(task missing)";
 	if (!state.task && planOrDesign) state.task = planOrDesign;
+	if (state.task && !readArtifact(cwd, config, "task.md").trim()) {
+		writeArtifact(cwd, config, state, "task.md", `# Task\n\n${state.task}\n`);
+	}
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "frontier-grill");
 	notify?.("Hybrid grill: frontier design stress test running...", "info");
@@ -5256,6 +6242,7 @@ async function runHybridStart(
 	notify?.("Hybrid start: running local scout...", "info");
 	const scoutSteering = hybridSteeringMarkdown(cwd, config);
 	if (scoutSteering) markHybridSteeringConsumed(cwd, config, "scout");
+	const requirementsContext = hybridRequirementsContext(cwd, config);
 	const scoutPrompt = [
 		"You are the LOCAL SCOUT in a hybrid coding harness.",
 		"Explore the repository with read-only tools and produce a compact, high-signal repo map for a frontier architect.",
@@ -5263,6 +6250,7 @@ async function runHybridStart(
 		"",
 		`Task: ${task}`,
 		...(scoutSteering ? ["", scoutSteering] : []),
+		...requirementsContext,
 		"",
 		"Output markdown with these sections:",
 		"1. Task interpretation and unknowns",
@@ -5303,6 +6291,7 @@ async function runHybridStart(
 		"",
 		`Task: ${task}`,
 		...(architectSteering ? ["", architectSteering] : []),
+		...requirementsContext,
 		"",
 		"Local scout map:",
 		"```markdown",
@@ -5516,6 +6505,7 @@ async function runLocalReview(
 	const interactivePolicy = interactiveRuntimePolicyApplies(cwd, config, task);
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "local-review");
+	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
 		"You are the FRONTIER IMPLEMENTATION REVIEWER in a hybrid coding harness.",
 		"Review the implementation against the frontier design. You are read-only. Do not modify files.",
@@ -5523,8 +6513,10 @@ async function runLocalReview(
 		"",
 		`Task: ${task}`,
 		...(steering ? ["", steering] : []),
+		...requirementsContext,
 		"",
 		"Read these artifacts first:",
+		`- ${config.stateDir}/requirements.md if present`,
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
 		`- ${config.stateDir}/test-evidence.md`,
@@ -5600,6 +6592,7 @@ async function runFrontierFinal(
 	const interactivePolicy = interactiveRuntimePolicyApplies(cwd, config, task);
 	const steering = hybridSteeringMarkdown(cwd, config);
 	if (steering) markHybridSteeringConsumed(cwd, config, "frontier-final");
+	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
 		"You are the FRONTIER FINAL GATE for a hybrid coding harness.",
 		"Spend frontier reasoning only on correctness, design drift, hidden risks, and whether this should ship.",
@@ -5607,6 +6600,7 @@ async function runFrontierFinal(
 		"",
 		`Task: ${task}`,
 		...(steering ? ["", steering] : []),
+		...requirementsContext,
 		"",
 		"## Frontier design package",
 		truncateMiddle(readArtifact(cwd, config, "frontier-design.md"), 40_000),
@@ -5944,45 +6938,68 @@ async function runHybridOrchestration(options: {
 					config.askUserOnAmbiguity &&
 					options.ctx?.hasUI
 				) {
-					const prefill = [
-						`# Hybrid clarification request`,
-						"",
-						"The harness found ambiguity that may materially change implementation.",
-						"",
-						...brief.blockingQuestions.map((q, i) => `${i + 1}. ${q}`),
-						"",
-						"## Your answers",
-						"",
-						"",
-					].join("\n");
-					const answers = await options.ctx.ui.editor?.(
-						"Hybrid clarification",
-						prefill,
-					);
-					if (typeof answers === "string" && answers.trim()) {
+					const action = await showHybridClarificationGate(options.ctx, brief);
+					if (action.kind === "run") {
+						const decision = [
+							"# Hybrid clarification decision",
+							"",
+							"사용자가 추가 답변 없이 현재 설계와 기본 가정대로 계속 진행하도록 승인했습니다.",
+							"",
+						].join("\n");
 						writeArtifact(
 							options.cwd,
 							config,
 							state,
 							"user-clarifications.md",
-							answers,
+							decision,
 						);
-						summary.push(
-							"- User clarifications captured in user-clarifications.md",
-							"",
+						brief.assumptions.push(
+							"User approved proceeding without additional clarification.",
 						);
-					} else {
-						const proceed = await options.ctx.ui.confirm?.(
-							"Proceed without clarification?",
-							brief.blockingQuestions.join("\n"),
-						);
-						if (!proceed)
-							throw new Error(
-								"Hybrid run stopped for user clarification. See .pi-harness/orchestration-brief.md",
-							);
 						summary.push(
 							"- User chose to proceed without additional clarification.",
 							"",
+						);
+					} else if (action.kind === "edit" || action.kind === "answer") {
+						const prefill = [
+							`# Hybrid clarification request`,
+							"",
+							"구현 결과를 바꿀 수 있는 질문입니다. 질문에 답하거나 진행 방식을 직접 지시하세요.",
+							"",
+							...brief.blockingQuestions.map((q, i) => `${i + 1}. ${q}`),
+							"",
+							"## 답변/진행 프롬프트",
+							"",
+							action.kind === "answer" ? action.text : "",
+							"",
+						].join("\n");
+						const answers = await options.ctx.ui.editor?.(
+							"Hybrid clarification",
+							prefill,
+						);
+						if (typeof answers === "string" && answers.trim()) {
+							writeArtifact(
+								options.cwd,
+								config,
+								state,
+								"user-clarifications.md",
+								answers,
+							);
+							brief.assumptions.push(
+								`User clarification: ${truncateMiddle(answers.trim(), 1000)}`,
+							);
+							summary.push(
+								"- User clarifications captured in user-clarifications.md",
+								"",
+							);
+						} else {
+							throw new Error(
+								"Hybrid run stopped for user clarification. See .pi-harness/orchestration-brief.md",
+							);
+						}
+					} else {
+						throw new Error(
+							"Hybrid run stopped for user clarification. See .pi-harness/orchestration-brief.md",
 						);
 					}
 				} else if (brief.recommendedAction === "stop") {
@@ -6355,11 +7372,12 @@ async function runHybridOrchestration(options: {
 						repairCycle,
 					)
 				) {
-					localVerdict = parseLocalVerdict(readArtifact(options.cwd, config, "local-review.md"));
+					const reviewText = readArtifact(options.cwd, config, "local-review.md");
+					localVerdict = parseLocalVerdict(reviewText);
 					reporter.stage(
 						"local-review",
 						"skipped",
-						`verdict=${localVerdict}`,
+						localReviewSummary(localVerdict, reviewText),
 					);
 					markHybridRunStage(
 						options.cwd,
@@ -6395,10 +7413,11 @@ async function runHybridOrchestration(options: {
 						liveLog,
 					);
 					localVerdict = review.verdict;
+					const reviewText = readArtifact(options.cwd, config, "local-review.md");
 					reporter.stage(
 						"local-review",
 						localVerdict === "FAIL" ? "failed" : "done",
-						`verdict=${localVerdict}`,
+						localReviewSummary(localVerdict, reviewText),
 					);
 					markHybridRunStage(
 						options.cwd,
@@ -6755,6 +7774,264 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		});
 	};
 
+	const startHybridRunAfterGate = (
+		kind: "interview" | "grill",
+		report: string,
+		config: HarnessConfig,
+		state: HarnessState,
+		ctx: any,
+	): boolean => {
+		if (!frontierGateReadyForHybridRun(kind, report)) {
+			ctx.ui.notify(
+				`Hybrid ${kind} is not ready for run yet. Answer the remaining gate question first.`,
+				"warning",
+			);
+			return false;
+		}
+		try {
+			ensureHybridGateTaskForRun(ctx.cwd, config, state, report);
+		} catch (error) {
+			ctx.ui.notify(
+				error instanceof Error ? error.message : String(error),
+				"error",
+			);
+			return false;
+		}
+		const { liveId } = startHybridBackgroundRun({
+			pi,
+			cwd: ctx.cwd,
+			ctx,
+			args: "",
+			mode: "default",
+		});
+		ctx.ui.notify(
+			`Hybrid ${kind} ready; /hybrid-run started in background (${liveId}). Use /hybrid-monitor to follow progress.`,
+			"info",
+		);
+		setStatusWidget(ctx, statusMarkdown(ctx.cwd, config, state));
+		return true;
+	};
+
+	const showHybridInterview = async (
+		initialResult: PiRunResult,
+		config: HarnessConfig,
+		state: HarnessState,
+		ctx: any,
+	) => {
+		let result = initialResult;
+		while (true) {
+			const report = readArtifact(ctx.cwd, config, "requirements.md");
+			const ready = frontierGateReadyForHybridRun("interview", report);
+			const displayReport = ready
+				? hybridGateApprovalSummaryKo("interview", report)
+				: report;
+			setStatusWidget(ctx, displayReport);
+			const action = ctx?.hasUI && ctx?.ui?.custom
+				? await ctx.ui.custom(
+					(tui: TUI, theme: any, _keybindings: unknown, done: (result: HybridGateAction) => void) =>
+						new HybridReportOverlayComponent(tui, "Hybrid Interview", displayReport, theme, done, {
+							choices: ready ? [] : extractHybridGateChoices(report),
+							ready,
+							allowGrill: ready,
+						}),
+					{
+						overlay: true,
+						overlayOptions: {
+							anchor: "center",
+							width: "90%",
+							minWidth: 70,
+							maxHeight: "80%",
+						},
+					},
+					)
+				: { kind: "close" } as HybridGateAction;
+			if (!(ctx?.hasUI && ctx?.ui?.custom)) {
+				pi.sendMessage({
+					customType: HYBRID_REPORT_MESSAGE_TYPE,
+					content: "Hybrid Interview",
+					display: true,
+					details: { title: "Hybrid Interview", markdown: displayReport },
+				});
+			}
+			ctx.ui.notify(
+				`Hybrid interview ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/requirements.md.`,
+				result.ok ? "info" : "warning",
+			);
+			if (action.kind === "run") {
+				startHybridRunAfterGate("interview", report, config, state, ctx);
+				return;
+			}
+			if (action.kind === "grill") {
+				const grill = await runWithHybridGateLoading(
+					ctx,
+					"Hybrid Grill",
+					"grill 검토를 준비하고 있습니다",
+					"frontier가 현재 interview 내용을 바탕으로 설계 리스크를 검토 중입니다.",
+					() => runFrontierGrill(
+						ctx.cwd,
+						config,
+						state,
+						report,
+						(message, type = "info") => ctx.ui.notify(message, type),
+					),
+				);
+				await showHybridGrill(grill, config, state, ctx);
+				return;
+			}
+			if (action.kind === "answer") {
+				result = await runWithHybridGateLoading(
+					ctx,
+					"Hybrid Interview",
+					"다음 질문을 준비하고 있습니다",
+					"frontier가 선택한 답변을 반영해 다음 질문 또는 구현 handoff를 작성 중입니다.",
+					() => runFrontierInterview(
+						ctx.cwd,
+						config,
+						state,
+						action.text,
+						(message, type = "info") => ctx.ui.notify(message, type),
+					),
+				);
+				continue;
+			}
+			if (action.kind !== "edit") return;
+
+			const answer = await ctx.ui.editor?.(
+				"Hybrid interview answer",
+				[
+					"# Hybrid interview answer",
+					"",
+					"Write your answer below. Save and close to submit it to the interview.",
+					"",
+					"## Answer",
+					"",
+					"",
+					"## Current interview",
+					"",
+					report,
+					"",
+				].join("\n"),
+			);
+			if (typeof answer !== "string") continue;
+			const draft = extractHybridInterviewAnswerDraft(answer);
+			if (!draft.trim()) continue;
+			result = await runWithHybridGateLoading(
+				ctx,
+				"Hybrid Interview",
+				"다음 질문을 준비하고 있습니다",
+				"frontier가 직접 입력한 답변을 반영해 다음 질문 또는 구현 handoff를 작성 중입니다.",
+				() => runFrontierInterview(
+					ctx.cwd,
+					config,
+					state,
+					draft,
+					(message, type = "info") => ctx.ui.notify(message, type),
+				),
+			);
+		}
+	};
+
+	const showHybridGrill = async (
+		initialResult: PiRunResult,
+		config: HarnessConfig,
+		state: HarnessState,
+		ctx: any,
+	) => {
+		let result = initialResult;
+		while (true) {
+			const report = readArtifact(ctx.cwd, config, "design-grill.md");
+			const ready = frontierGateReadyForHybridRun("grill", report);
+			const displayReport = ready
+				? hybridGateApprovalSummaryKo("grill", report)
+				: report;
+			setStatusWidget(ctx, displayReport);
+			const action = ctx?.hasUI && ctx?.ui?.custom
+				? await ctx.ui.custom(
+					(tui: TUI, theme: any, _keybindings: unknown, done: (result: HybridGateAction) => void) =>
+						new HybridReportOverlayComponent(tui, "Hybrid Grill", displayReport, theme, done, {
+							choices: ready ? [] : extractHybridGateChoices(report),
+							ready,
+						}),
+					{
+						overlay: true,
+						overlayOptions: {
+							anchor: "center",
+							width: "90%",
+							minWidth: 70,
+							maxHeight: "80%",
+						},
+					},
+				)
+				: { kind: "close" } as HybridGateAction;
+			if (!(ctx?.hasUI && ctx?.ui?.custom)) {
+				pi.sendMessage({
+					customType: HYBRID_REPORT_MESSAGE_TYPE,
+					content: "Hybrid Grill",
+					display: true,
+					details: { title: "Hybrid Grill", markdown: displayReport },
+				});
+			}
+			ctx.ui.notify(
+				`Hybrid grill ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/design-grill.md.`,
+				result.ok ? "info" : "warning",
+			);
+			if (action.kind === "run") {
+				startHybridRunAfterGate("grill", report, config, state, ctx);
+				return;
+			}
+			if (action.kind === "answer") {
+				result = await runWithHybridGateLoading(
+					ctx,
+					"Hybrid Grill",
+					"다음 grill 응답을 준비하고 있습니다",
+					"frontier가 선택한 답변을 반영해 추가 질문 또는 최종 검토 내용을 작성 중입니다.",
+					() => runFrontierGrill(
+						ctx.cwd,
+						config,
+						state,
+						action.text,
+						(message, type = "info") => ctx.ui.notify(message, type),
+					),
+				);
+				continue;
+			}
+			if (action.kind !== "edit") return;
+
+			const answer = await ctx.ui.editor?.(
+				"Hybrid grill answer",
+				[
+					"# Hybrid grill answer",
+					"",
+					"Write your answer or design revision below. Save and close to submit it to the grill.",
+					"",
+					"## Answer",
+					"",
+					"",
+					"## Current grill",
+					"",
+					report,
+					"",
+				].join("\n"),
+			);
+			if (typeof answer !== "string") continue;
+			const draft = extractHybridInterviewAnswerDraft(answer);
+			if (!draft.trim()) continue;
+			result = await runWithHybridGateLoading(
+				ctx,
+				"Hybrid Grill",
+				"다음 grill 응답을 준비하고 있습니다",
+				"frontier가 직접 입력한 답변을 반영해 추가 질문 또는 최종 검토 내용을 작성 중입니다.",
+				() => runFrontierGrill(
+					ctx.cwd,
+					config,
+					state,
+					draft,
+					(message, type = "info") => ctx.ui.notify(message, type),
+				),
+			);
+		}
+	};
+
 	let activeHybridMonitorClose: (() => void) | undefined;
 	async function openHybridMonitor(ctx: any, liveId?: string): Promise<void> {
 		if (activeHybridMonitorClose) {
@@ -7100,6 +8377,20 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("hybrid-stages", {
+		description: "Show stage IDs usable with /hybrid-resume-from",
+		handler: async (_args, ctx) => {
+			const report = [
+				"# Hybrid Stages",
+				"",
+				...hybridStageReferenceMarkdown().split("\n"),
+			].join("\n");
+			setStatusWidget(ctx, report);
+			await showReport("Hybrid Stages", report, ctx);
+			ctx.ui.notify("Hybrid stage IDs listed.", "info");
+		},
+	});
+
 	pi.registerCommand("hybrid-usage", {
 		description:
 			"Show local vs frontier recorded token/cost usage for hybrid artifacts",
@@ -7174,6 +8465,56 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			handleHybridRun(args, ctx, { maxFrontierPasses: 2 }, "thorough"),
 	});
 
+	pi.registerCommand("hybrid-resume", {
+		description:
+			"Resume the current hybrid task from the last incomplete stage",
+		handler: async (_args, ctx) => handleHybridRun("", ctx, {}, "default"),
+	});
+
+	pi.registerCommand("hybrid-new", {
+		description:
+			"Archive the current hybrid run artifacts and start a fresh task boundary",
+		handler: async (args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			const active = getHybridActiveRun();
+			const lock = readHybridRunLock(ctx.cwd, config);
+			if (active || (lock && !isHybridRunLockStale(lock))) {
+				ctx.ui.notify(
+					"Hybrid run is active. Finish, cancel, or wait before starting /hybrid-new.",
+					"error",
+				);
+				return;
+			}
+			if (lock && isHybridRunLockStale(lock)) {
+				clearHybridRunLock(ctx.cwd, config, lock.liveId);
+			}
+			const task = args.trim();
+			const { archive } = startNewHybridTask(ctx.cwd, config, task);
+			const report = [
+				"# Hybrid New Task",
+				"",
+				archive ? `- Archived previous run: \`${archive}\`` : "- Previous run: nothing to archive",
+				task
+					? `- New task: ${task}`
+					: "- New task: not set yet. Run /hybrid-interview <task> or /hybrid-grill <task> next.",
+				"",
+				"Next:",
+				"- /hybrid-new <next task>",
+				"- /hybrid-interview <next task>",
+				"- /hybrid-grill <next task>",
+				"- then approve run from the gate modal",
+			].join("\n");
+			setStatusWidget(ctx, report);
+			await showReport("Hybrid New Task", report, ctx);
+			ctx.ui.notify(
+				task
+					? "Hybrid new task boundary created."
+					: "Hybrid reset for a new task. Use /hybrid-interview <task> or /hybrid-grill <task>.",
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("hybrid-retry", {
 		description:
 			"Clear one completed hybrid stage checkpoint so /hybrid-run reruns it",
@@ -7194,7 +8535,37 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const config = loadConfig(ctx.cwd);
 			const state = loadState(ctx.cwd, config);
-			const removed = clearHybridStageFrom(ctx.cwd, config, state, args.trim());
+			const stageArg = args.trim();
+			if (!stageArg) {
+				const report = [
+					"# Hybrid Resume From",
+					"",
+					"재개할 stage ID가 필요합니다.",
+					"",
+					...hybridStageReferenceMarkdown().split("\n"),
+				].join("\n");
+				await showReport("Hybrid Resume From", report, ctx);
+				ctx.ui.notify(
+					"Usage: /hybrid-resume-from <stage>. Run /hybrid-stages for the list.",
+					"warning",
+				);
+				return;
+			}
+			let removed: string[];
+			try {
+				removed = clearHybridStageFrom(ctx.cwd, config, state, stageArg);
+			} catch (error) {
+				const report = [
+					"# Hybrid Resume From",
+					"",
+					String(error instanceof Error ? error.message : error),
+					"",
+					...hybridStageReferenceMarkdown().split("\n"),
+				].join("\n");
+				await showReport("Hybrid Resume From", report, ctx);
+				ctx.ui.notify("Unknown hybrid stage. Run /hybrid-stages.", "error");
+				return;
+			}
 			const { liveId } = startHybridBackgroundRun({
 				pi,
 				cwd: ctx.cwd,
@@ -7202,7 +8573,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				args: "",
 			});
 			ctx.ui.notify(
-				`Hybrid resumed from ${args.trim()} (${removed.length} artifact(s) cleared, ${liveId}).`,
+				`Hybrid resumed from ${stageArg} (${removed.length} artifact(s) cleared, ${liveId}).`,
 				"info",
 			);
 		},
@@ -7214,20 +8585,20 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const config = loadConfig(ctx.cwd);
 			const state = loadState(ctx.cwd, config);
-			const result = await runFrontierInterview(
-				ctx.cwd,
-				config,
-				state,
-				args,
-				(message, type = "info") => ctx.ui.notify(message, type),
+			const result = await runWithHybridGateLoading(
+				ctx,
+				"Hybrid Interview",
+				"첫 질문을 준비하고 있습니다",
+				"frontier가 requirements interview를 시작 중입니다.",
+				() => runFrontierInterview(
+					ctx.cwd,
+					config,
+					state,
+					args,
+					(message, type = "info") => ctx.ui.notify(message, type),
+				),
 			);
-			const report = readArtifact(ctx.cwd, config, "requirements.md");
-			setStatusWidget(ctx, report);
-			await showReport("Hybrid Interview", report, ctx);
-			ctx.ui.notify(
-				`Hybrid interview ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/requirements.md`,
-				result.ok ? "info" : "warning",
-			);
+			await showHybridInterview(result, config, state, ctx);
 		},
 	});
 
@@ -7237,20 +8608,20 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const config = loadConfig(ctx.cwd);
 			const state = loadState(ctx.cwd, config);
-			const result = await runFrontierGrill(
-				ctx.cwd,
-				config,
-				state,
-				args,
-				(message, type = "info") => ctx.ui.notify(message, type),
+			const result = await runWithHybridGateLoading(
+				ctx,
+				"Hybrid Grill",
+				"첫 grill 응답을 준비하고 있습니다",
+				"frontier가 설계 grill을 시작 중입니다.",
+				() => runFrontierGrill(
+					ctx.cwd,
+					config,
+					state,
+					args,
+					(message, type = "info") => ctx.ui.notify(message, type),
+				),
 			);
-			const report = readArtifact(ctx.cwd, config, "design-grill.md");
-			setStatusWidget(ctx, report);
-			await showReport("Hybrid Grill", report, ctx);
-			ctx.ui.notify(
-				`Hybrid grill ${result.ok ? "complete" : "failed"}. See ${config.stateDir}/design-grill.md`,
-				result.ok ? "info" : "warning",
-			);
+			await showHybridGrill(result, config, state, ctx);
 		},
 	});
 
@@ -7614,6 +8985,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			const scoutSteering = hybridSteeringMarkdown(ctx.cwd, config);
 			if (scoutSteering)
 				markHybridSteeringConsumed(ctx.cwd, config, "scout");
+			const requirementsContext = hybridRequirementsContext(ctx.cwd, config);
 			const scoutPrompt = [
 				"You are the LOCAL SCOUT in a hybrid coding harness.",
 				"Explore the repository with read-only tools and produce a compact, high-signal repo map for a frontier architect.",
@@ -7621,6 +8993,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				"",
 				`Task: ${task}`,
 				...(scoutSteering ? ["", scoutSteering] : []),
+				...requirementsContext,
 				"",
 				"Output markdown with these sections:",
 				"1. Task interpretation and unknowns",
@@ -7658,6 +9031,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				"",
 				`Task: ${task}`,
 				...(architectSteering ? ["", architectSteering] : []),
+				...requirementsContext,
 				"",
 				"Local scout map:",
 				"```markdown",

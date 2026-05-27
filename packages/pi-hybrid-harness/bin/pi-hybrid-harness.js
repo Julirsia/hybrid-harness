@@ -87,6 +87,66 @@ function packageNameForLocalSource(source) {
   }
 }
 
+function normalizePackageNameFromNpmSource(source) {
+  if (!source.startsWith("npm:")) return undefined;
+  const spec = source.slice("npm:".length);
+  if (spec.startsWith("@")) {
+    const secondAt = spec.indexOf("@", 1);
+    return secondAt === -1 ? spec : spec.slice(0, secondAt);
+  }
+  const at = spec.indexOf("@");
+  return at === -1 ? spec : spec.slice(0, at);
+}
+
+function packageNameForSource(source, baseDir) {
+  if (typeof source !== "string") return undefined;
+  const npmName = normalizePackageNameFromNpmSource(source);
+  if (npmName) return npmName;
+  if (!isLocalSource(source)) return undefined;
+  try {
+    const pkgPath = join(resolve(baseDir, source), "package.json");
+    if (!existsSync(pkgPath)) {
+      return source.split(/[\\/]/).filter(Boolean).pop();
+    }
+    return JSON.parse(readFileSync(pkgPath, "utf8")).name;
+  } catch {
+    return source.split(/[\\/]/).filter(Boolean).pop();
+  }
+}
+
+function packageSource(entry) {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object" && typeof entry.source === "string") {
+    return entry.source;
+  }
+  return undefined;
+}
+
+function cleanupConflictingUserInstalls(opts) {
+  if (opts.local) return;
+  const settingsPath = join(process.env.HOME || "", ".pi", "agent", "settings.json");
+  if (!existsSync(settingsPath)) return;
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  } catch {
+    return;
+  }
+  if (!Array.isArray(settings.packages)) return;
+  const baseDir = join(process.env.HOME || "", ".pi", "agent");
+  const before = settings.packages;
+  const after = before.filter((entry) => {
+    const source = packageSource(entry);
+    if (!source) return true;
+    return packageNameForSource(source, baseDir) !== pkg.name;
+  });
+  if (after.length === before.length) return;
+  settings.packages = after;
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  const removed = before.filter((entry) => !after.includes(entry)).map((entry) => packageSource(entry) ?? JSON.stringify(entry));
+  console.log(`Removed conflicting user-global install(s) from ${settingsPath}: ${removed.join(", ")}`);
+}
+
 function cleanupConflictingLocalInstalls(opts) {
   if (!opts.local) return;
   if (isLocalSource(opts.source)) return;
@@ -110,6 +170,7 @@ function cleanupConflictingLocalInstalls(opts) {
 
 function install(opts) {
   console.log(`Installing ${opts.source}${opts.local ? " project-locally" : " user-globally"}...`);
+  cleanupConflictingUserInstalls(opts);
   cleanupConflictingLocalInstalls(opts);
   run(scopedArgs(["install", opts.source], opts.local));
   if (opts.companions) {

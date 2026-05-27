@@ -104,6 +104,38 @@ test("hybrid monitor renders live token routing and configured savings", () => {
 	assert.match(source, /frontierOutputCostPerMTok/);
 });
 
+test("hybrid live monitor prioritizes Korean interactive status", () => {
+	assert.match(source, /function koreanHybridRunOverviewLines/);
+	assert.match(source, /function hybridStageLabelKo/);
+	assert.match(source, /function childModelText/);
+	assert.match(source, /function compactHybridLiveOutput/);
+	assert.match(source, /function ratioBar/);
+	assert.match(source, /function statusBadge/);
+	assert.match(source, /function stageSummaryKo/);
+	assert.match(source, /function localReviewSummary/);
+	const monitorBlock = between("class HybridMonitorOverlayComponent", "class HybridLiveMessageComponent");
+	assert.match(monitorBlock, /koreanHybridRunOverviewLines\(details,\s*th,\s*now\)/);
+	assert.match(monitorBlock, /실시간 로그/);
+	assert.match(monitorBlock, /compactHybridLiveOutput\(rawLog\)/);
+	assert.match(monitorBlock, /let bodyRowsWritten = 0/);
+	assert.match(monitorBlock, /for \(let i = bodyRowsWritten; i < bodyHeight; i\+\+\)/);
+	assert.doesNotMatch(monitorBlock, /Math\.min\(bodyHeight,\s*6\)/);
+	assert.match(source, /현재 상황/);
+	assert.match(source, /현재 슬라이스/);
+	assert.match(source, /모델 \$\{child\.model\}/);
+	assert.match(source, /type: "child_start"/);
+	assert.match(source, /model: options\.model/);
+	assert.match(source, /currentSliceTitle/);
+	assert.match(source, /currentSliceRemaining/);
+	assert.match(source, /진행률/);
+	assert.match(source, /다음 행동/);
+	assert.match(source, /단계 흐름/);
+	assert.match(source, /판정: FAIL/);
+	assert.match(source, /이유:/);
+	assert.match(source, /조각/);
+	assert.match(source, /승인 기준/);
+});
+
 test("progress reconciliation accepts completion aliases and rewrites canonical markdown", () => {
 	assert.match(source, /function normalizeSliceStatus/);
 	assert.match(source, /function normalizeCriterionStatus/);
@@ -170,7 +202,8 @@ test("resume skips completed artifact-backed stages before rerunning child sessi
 	assert.match(block, /shouldSkipHybridStage\([^)]*"design"/);
 	assert.match(block, /shouldSkipHybridStage\([^)]*"brief"/);
 	assert.match(block, /shouldSkipHybridStage\([^)]*"finish"/);
-	assert.match(block, /parseLocalVerdict\(readArtifact\(options\.cwd,\s*config,\s*"local-review\.md"\)\)/);
+	assert.match(block, /const reviewText = readArtifact\(options\.cwd,\s*config,\s*"local-review\.md"\)/);
+	assert.match(block, /parseLocalVerdict\(reviewText\)/);
 	assert.match(block, /parseFrontierVerdict\(readArtifact\(options\.cwd,\s*config,\s*"final-review\.md"\)\)/);
 	assert.match(block, /reporter\.stage\(\s*"frontier-final",\s*"skipped"/);
 });
@@ -276,21 +309,37 @@ test("monitor has explicit two-step cancel while esc only closes", () => {
 	assert.match(block, /private cancelArmed = false/);
 	assert.match(block, /abortHybridActiveRun\(this\.cwd\)/);
 	assert.match(block, /data === "x"/);
-	assert.match(block, /Press x again to cancel/);
+	assert.match(block, /실행 취소하려면 x를 한 번 더 누르세요/);
 	assert.match(block, /matchesKey\(data,\s*Key\.escape\)[\s\S]*this\.close\(\);[\s\S]*if \(data === "x"/);
 });
 
 test("hybrid retry and resume-from clear stage checkpoints", () => {
 	assert.match(source, /function clearHybridStageCheckpoint/);
 	assert.match(source, /function clearHybridStageFrom/);
+	assert.match(source, /function hybridStageReferenceMarkdown/);
+	assert.match(source, /function hybridStageDescriptionKo/);
 	assert.match(source, /pi\.registerCommand\("hybrid-retry"/);
+	assert.match(source, /pi\.registerCommand\("hybrid-resume"/);
 	assert.match(source, /pi\.registerCommand\("hybrid-resume-from"/);
+	assert.match(source, /pi\.registerCommand\("hybrid-stages"/);
+	assert.match(source, /handleHybridRun\("",\s*ctx,\s*\{\},\s*"default"\)/);
 	assert.match(source, /clearHybridStageCheckpoint\(ctx\.cwd,\s*config,\s*state,\s*args\.trim\(\)/);
-	assert.match(source, /clearHybridStageFrom\(ctx\.cwd,\s*config,\s*state,\s*args\.trim\(\)/);
+	assert.match(source, /clearHybridStageFrom\(ctx\.cwd,\s*config,\s*state,\s*stageArg\)/);
+	assert.match(source, /\/hybrid-resume-from <stage>/);
+	assert.match(source, /\/hybrid-resume/);
+	assert.match(source, /재개 가능한 단계/);
+	assert.match(source, /Run \/hybrid-stages to see descriptions/);
+	assert.match(source, /Usage: \/hybrid-resume-from <stage>/);
+	assert.match(source, /Unknown hybrid stage\. Run \/hybrid-stages\./);
 });
 
 test("serious task plan review is a first-class stage before local implementation", () => {
 	assert.match(source, /type PlanReviewVerdict = "READY" \| "NEEDS_REVISION" \| "ESCALATE_TO_USER"/);
+	assert.match(source, /function stringifyBriefItem/);
+	assert.doesNotMatch(source, /blockingQuestions\.map\(String\)/);
+	assert.match(source, /function showHybridClarificationGate/);
+	assert.match(source, /답변\/진행 프롬프트 입력/);
+	assert.match(source, /답변 없이 계속 진행/);
 
 	const stageTypeBlock = between("type HybridRunStageId =", "interface HybridRunStage");
 	assert.match(stageTypeBlock, /\|\s*"plan-review"/);
@@ -309,8 +358,8 @@ test("serious task plan review is a first-class stage before local implementatio
 	assert.match(artifactBlock, /stage === "plan-review"[\s\S]*"plan-review\.md"/);
 	assert.match(artifactBlock, /stage === "finish"[\s\S]*"claim-evidence-matrix\.md"/);
 
-	const cleanBlock = between("function cleanRunArtifacts", "function truncateMiddle");
-	assert.match(cleanBlock, /"plan-review\.md"/);
+	const artifactListBlock = between("const HYBRID_RUN_ARTIFACTS", "function cleanRunArtifacts");
+	assert.match(artifactListBlock, /"plan-review\.md"/);
 
 	const syncBlock = between("function syncHarnessArtifacts", "function reconcileHybridCompletion");
 	assert.match(syncBlock, /"plan-review\.md"/);
@@ -343,9 +392,9 @@ test("frontier design gate commands use frontier model and durable artifacts", (
 	assert.match(grillBlock, /thinking: config\.frontierThinking/);
 	assert.match(grillBlock, /writeArtifact\([^)]*"design-grill\.md"/s);
 
-	const cleanBlock = between("function cleanRunArtifacts", "function truncateMiddle");
-	assert.match(cleanBlock, /"requirements\.md"/);
-	assert.match(cleanBlock, /"design-grill\.md"/);
+	const artifactListBlock = between("const HYBRID_RUN_ARTIFACTS", "function cleanRunArtifacts");
+	assert.match(artifactListBlock, /"requirements\.md"/);
+	assert.match(artifactListBlock, /"design-grill\.md"/);
 
 	const syncBlock = between("function syncHarnessArtifacts", "function reconcileHybridCompletion");
 	assert.match(syncBlock, /"requirements\.md"/);
@@ -354,10 +403,74 @@ test("frontier design gate commands use frontier model and durable artifacts", (
 	const commandBlock = between('pi.registerCommand("hybrid-interview"', 'pi.registerCommand("hybrid-steer"');
 	assert.match(commandBlock, /pi\.registerCommand\("hybrid-interview"/);
 	assert.match(commandBlock, /runFrontierInterview\(/);
-	assert.match(commandBlock, /showReport\("Hybrid Interview"/);
+	const interviewCommandBlock = between('pi.registerCommand("hybrid-interview"', 'pi.registerCommand("hybrid-grill"');
+	assert.doesNotMatch(interviewCommandBlock, /showReport\("Hybrid Interview"/);
+	assert.match(interviewCommandBlock, /showHybridInterview\(/);
+	const interactiveInterviewBlock = between("const showHybridInterview =", 'pi.registerCommand("hybrid-interview"');
+	assert.match(interactiveInterviewBlock, /ctx\.ui\.editor/);
+	assert.match(interactiveInterviewBlock, /runFrontierInterview\(/);
+	assert.match(interactiveInterviewBlock, /extractHybridInterviewAnswerDraft/);
+	assert.match(interactiveInterviewBlock, /action\.kind === "answer"/);
+	assert.match(interactiveInterviewBlock, /action\.kind === "run"/);
+	assert.match(interactiveInterviewBlock, /action\.kind === "grill"/);
+	assert.match(interactiveInterviewBlock, /action\.kind !== "edit"/);
+	assert.match(interactiveInterviewBlock, /Current interview/);
+	assert.match(source, /type HybridGateAction/);
+	assert.match(source, /extractHybridGateChoices/);
+	assert.match(source, /확정할까요/);
+	assert.match(source, /추천/);
+	assert.match(source, /markerIndex/);
+	assert.match(source, /hybridGateApprovalSummaryKo/);
+	assert.match(source, /이대로 충분합니다/);
+	assert.match(source, /그래도 grill/);
+	assert.match(source, /이 내용으로 run/);
+	assert.match(source, /ensureHybridGateTaskForRun/);
+	assert.match(source, /pi\.registerCommand\("hybrid-new"/);
+	assert.match(source, /startNewHybridTask/);
+	assert.match(source, /archiveHybridRunArtifacts/);
+	assert.match(source, /hybrid-new <next task>/);
+	assert.match(source, /e 직접 입력/);
+	assert.match(source, /selectGateItem\(this\.gateItems\[alphaIndex\]/);
+	assert.match(source, /matchesKey\(data, Key\.left\)/);
+	assert.match(source, /moveGateSelection/);
+	assert.match(source, /setSelectedIndex/);
+	assert.match(source, /for \(let i = visible\.length; i < bodyHeight; i\+\+\)/);
+	assert.match(source, /for \(let i = 0; i < pickerLinesHeight; i\+\+\)/);
+	assert.doesNotMatch(source, /matchesKey\(data, Key\.up\) \|\|\n\t\t\tmatchesKey\(data, Key\.down\)/);
+	const overlayBlock = between("class HybridReportOverlayComponent", "function stripHybridArtifactFooter");
+	const overlayInputBlock = between("handleInput(data: string): void {", "\n\tprivate buildGateItems");
+	assert.ok(
+		overlayInputBlock.indexOf("matchesKey(data, Key.left)") <
+			overlayInputBlock.indexOf("matchesKey(data, Key.up)"),
+		"picker left/right handling should be separate from report up/down scrolling",
+	);
+	assert.match(overlayInputBlock, /matchesKey\(data, Key\.down\)[\s\S]+this\.scrollOffset = Math\.max\(0, this\.scrollOffset - 1\)/);
+	assert.match(overlayInputBlock, /matchesKey\(data, Key\.pageDown\)[\s\S]+this\.scrollOffset = Math\.max\(0, this\.scrollOffset - 10\)/);
+	assert.doesNotMatch(overlayBlock, /for \(const line of this\.selectList\.render\(bodyW\)\)/);
+	assert.doesNotMatch(overlayBlock, /selectList\.render\(bodyW\)/);
+	assert.match(overlayBlock, /private renderGateItem/);
+	assert.doesNotMatch(overlayBlock, /selectList\.handleInput\(matchesKey\(data, Key\.left\) \? Key\.up : Key\.down\)/);
+	assert.match(source, /class HybridGateLoadingOverlayComponent/);
+	assert.match(source, /runWithHybridGateLoading/);
+	assert.match(source, /다음 질문을 준비하고 있습니다/);
+	assert.match(source, /완료되면 다음 모달이 열립니다/);
+	assert.doesNotMatch(source, /s submit draft/);
 	assert.match(commandBlock, /pi\.registerCommand\("hybrid-grill"/);
 	assert.match(commandBlock, /runFrontierGrill\(/);
-	assert.match(commandBlock, /showReport\("Hybrid Grill"/);
+	assert.match(commandBlock, /showHybridGrill\(/);
+	assert.doesNotMatch(commandBlock, /prepareHybridGateState\(/);
+
+	const startBlock = between("async function runHybridStart", "async function runLocalLoop");
+	assert.match(startBlock, /hybridRequirementsContext\(/);
+	assert.match(source, /requirements\.md/);
+	assert.match(source, /Requirements interview/);
+	const workerPromptBlock = between("function localWorkerPrompt", "type Notify");
+	assert.match(workerPromptBlock, /requirements\.md/);
+	assert.match(workerPromptBlock, /root REQUIREMENTS\.md/);
+	const progressPlanBlock = between("async function createProgressFromDesign", "async function updateProgressAfterIteration");
+	assert.match(progressPlanBlock, /requirements\.md/);
+	assert.match(source, /한국어 요약/);
+	assert.match(source, /startHybridBackgroundRun\(/);
 });
 
 test("plan review parser blocks missing, non-ready, or disagreed verdicts", () => {

@@ -13,6 +13,11 @@
     "test:codex": "npm test -w qwen-harness-codex",
     "test:qwen": "npm test -w qwen-harness-opencode",
     "pack:pi": "npm run pack:dry -w pi-hybrid-harness",
+    "install:plugins": "./scripts/update-plugins.sh",
+    "update:plugins": "./scripts/update-plugins.sh",
+    "update:pi": "./scripts/update-plugins.sh pi",
+    "update:opencode": "./scripts/update-plugins.sh opencode",
+    "update:codex": "./scripts/update-plugins.sh codex",
     "install:opencode": "npm run install:global -w qwen-harness-opencode",
     "uninstall:opencode": "npm run uninstall:global -w qwen-harness-opencode"
   }

@@ -42,6 +42,8 @@
 │       ├── uninstall.sh
 │       ├── package.json
 │       └── README.md
+├── scripts/
+│   └── update-plugins.sh
 ├── package.json
 └── package-lock.json
 ```
@@ -143,15 +145,44 @@ npm pack --dry-run -w qwen-harness-codex
 
 ## 로컬 설치
 
-### Pi package를 이 checkout에서 설치
-
-저장소 루트에서:
+이 checkout에 있는 최신 소스를 사용자 Pi/OpenCode/Codex 설정에 한 번에 반영하려면 저장소 루트에서 실행합니다. Pi는 user-global package로 등록되므로 작업 프로젝트마다 다시 설치하지 않아도 됩니다.
 
 ```sh
-npx ./packages/pi-hybrid-harness install -l --source ./packages/pi-hybrid-harness
+./scripts/update-plugins.sh
 ```
 
-설치 후 Pi에서 reload합니다.
+npm script로도 같은 작업을 실행할 수 있습니다.
+
+```sh
+npm run install:plugins
+npm run update:plugins
+```
+
+개별 업데이트:
+
+```sh
+npm run update:pi
+npm run update:opencode
+npm run update:codex
+```
+
+업데이트 후에는 사용하는 host를 reload/restart합니다.
+
+```text
+Pi: /reload
+OpenCode: restart TUI
+Codex: restart session
+```
+
+### Pi package를 이 checkout에서 수동 전역 설치
+
+개별 CLI를 직접 실행하려면:
+
+```sh
+npx ./packages/pi-hybrid-harness install --source ./packages/pi-hybrid-harness
+```
+
+설치 후 Pi에서 reload합니다. 예전에 특정 프로젝트에 `-l`로 project-local 설치해 둔 항목이 있으면 그 프로젝트에서는 local 설정이 우선할 수 있으니 필요할 때 한 번 제거하세요.
 
 ```text
 /reload
@@ -210,6 +241,14 @@ npm run test:qwen
 
 # Pi package dry-run pack
 npm run pack:pi
+
+# Pi/OpenCode/Codex plugin 개발 checkout 업데이트
+npm run update:plugins
+
+# 개별 plugin 업데이트
+npm run update:pi
+npm run update:opencode
+npm run update:codex
 
 # OpenCode plugin 사용자 설치
 npx qwen-harness-opencode install
