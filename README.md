@@ -166,6 +166,24 @@ npm run update:opencode
 npm run update:codex
 ```
 
+Pi package는 git source로도 설치/업데이트할 수 있습니다. 특정 프로젝트에만 project-local로 설치하려면 작업 프로젝트 루트에서 실행합니다.
+
+```sh
+pi install -l git:github.com/Julirsia/hybrid-harness@main
+```
+
+이미 git source로 설치한 항목은 다음처럼 갱신할 수 있습니다.
+
+```sh
+pi update git:github.com/Julirsia/hybrid-harness@main
+```
+
+태그를 만들어 push한 뒤에는 `@main` 대신 `@v0.2.10` 같은 태그 ref를 사용할 수 있습니다. `npm run update:pi`로 같은 source를 쓰려면 source를 환경 변수로 넘깁니다.
+
+```sh
+PI_HYBRID_HARNESS_SOURCE=git:github.com/Julirsia/hybrid-harness@main npm run update:pi
+```
+
 업데이트 후에는 사용하는 host를 reload/restart합니다.
 
 ```text

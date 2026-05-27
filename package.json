@@ -8,6 +8,11 @@
     "packages/qwen-harness-codex",
     "packages/qwen-harness-opencode"
   ],
+  "pi": {
+    "extensions": [
+      "./packages/pi-hybrid-harness/extensions"
+    ]
+  },
   "scripts": {
     "test": "npm run test --workspaces --if-present",
     "test:codex": "npm test -w qwen-harness-codex",

@@ -25,6 +25,10 @@ After updating:
   - Pi: installed user-globally from this checkout; run /reload or restart Pi.
   - OpenCode: restart the TUI.
   - Codex: restart the session so the skill/MCP config reloads.
+
+Environment:
+  PI_HYBRID_HARNESS_SOURCE  Override the Pi package source.
+                            Example: git:github.com/Julirsia/hybrid-harness@main
 USAGE
 }
 
@@ -45,7 +49,7 @@ update_pi() {
   run node \
     "$ROOT/packages/pi-hybrid-harness/bin/pi-hybrid-harness.js" \
     install \
-    --source "$ROOT/packages/pi-hybrid-harness"
+    --source "${PI_HYBRID_HARNESS_SOURCE:-$ROOT/packages/pi-hybrid-harness}"
 }
 
 update_opencode() {
