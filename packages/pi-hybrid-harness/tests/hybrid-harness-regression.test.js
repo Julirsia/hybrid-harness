@@ -634,3 +634,35 @@ test("local and frontier reviewers require claim-evidence review and adversarial
 	assert.match(finalBlock, /state reentry\/idempotency/);
 	assert.match(finalBlock, /public API, data integrity, authentication, payment, migration, or long-lived state/);
 });
+
+test("manual-only acceptance criteria are UNVERIFIED and cannot roll up to PASS/APPROVE", () => {
+	assert.match(source, /is UNVERIFIED, not satisfied/);
+	assert.match(source, /Do not let 'manual audit required'/);
+	// Frontier implementation review (verdict PASS|PASS_WITH_CONCERNS|FAIL).
+	const localReviewBlock = between("async function runLocalReview", "async function runFrontierFinal");
+	assert.match(localReviewBlock, /is UNVERIFIED, not satisfied/);
+	assert.match(
+		localReviewBlock,
+		/every required behavioral acceptance criterion has executed evidence/,
+	);
+	// Frontier final gate (verdict APPROVE|REQUEST_CHANGES|ESCALATE_TO_USER).
+	const finalBlock = between("async function runFrontierFinal", "async function runHybridOrchestration");
+	assert.match(finalBlock, /UNVERIFIED, not satisfied/);
+	assert.match(finalBlock, /must not roll up to APPROVE/);
+	// Local progress reviewer must also refuse to mark a manual-only criterion satisfied.
+	assert.match(source, /must not roll up to a satisfied criterion/);
+});
+
+test("cross-component seam criteria require executable end-to-end evidence", () => {
+	assert.match(source, /Cross-component seam criteria/);
+	assert.match(source, /PATCH vs PUT/);
+	const workerBlock = between("function localWorkerPrompt", "type Notify");
+	assert.match(
+		workerBlock,
+		/executable end-to-end check that drives the consumer against the real producer/,
+	);
+	const localReviewBlock = between("async function runLocalReview", "async function runFrontierFinal");
+	assert.match(localReviewBlock, /Cross-component seam criteria/);
+	const finalBlock = between("async function runFrontierFinal", "async function runHybridOrchestration");
+	assert.match(finalBlock, /Cross-component seam criteria/);
+});
