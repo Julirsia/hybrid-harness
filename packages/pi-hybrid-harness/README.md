@@ -13,32 +13,32 @@ The goal is to spend frontier-model tokens on high-leverage design and quality g
 - State directory: `.pi-harness/`
 - Local endpoint: `http://192.168.0.44:8080/v1`
 - Local worker: `local-qwen/qwen36-27b-mtp-iq4xs`
-- Local reviewer: `local-qwen/qwen36-35b-a3b-iq4xs`
+- Local reviewer: `local-qwen/qwen36-27b-mtp-iq4xs`
 - Frontier: `openai-codex/gpt-5.5` with `high` thinking
 
 The extension dynamically registers a `local-qwen` provider from the llama.cpp `/v1/models` endpoint. It also registers a `hybrid_run` custom tool with compact/expanded Pi TUI rendering for live harness progress.
 
 ## Install / update
 
-Once published to npm, project-local install is:
+The recommended source is the GitHub ref. This keeps Pi aligned with the commits pushed to this repository instead of relying on an npm package publish or package version bump.
 
 ```bash
-npx pi-hybrid-harness install -l
+pi install -l git:github.com/Julirsia/hybrid-harness@main
 ```
 
 Update later with:
 
 ```bash
-npx pi-hybrid-harness update -l
+pi update git:github.com/Julirsia/hybrid-harness@main
 ```
 
-The npx CLI is a thin wrapper around Pi package commands. The equivalent direct command for both install and project-local refresh is:
+From the monorepo root, the same git source can be passed through the helper script:
 
 ```bash
-pi install -l npm:pi-hybrid-harness
+PI_HYBRID_HARNESS_SOURCE=git:github.com/Julirsia/hybrid-harness@main npm run update:pi
 ```
 
-For local development from this checkout:
+For local development from this checkout, install the local path instead. This uses your working tree directly and does not automatically track GitHub `main`.
 
 ```bash
 npx . install -l --source .
@@ -184,7 +184,7 @@ Create `.pi-harness/config.json`:
   "frontierModel": "openai-codex/gpt-5.5",
   "frontierThinking": "high",
   "localWorkerModel": "local-qwen/qwen36-27b-mtp-iq4xs",
-  "localReviewerModel": "local-qwen/qwen36-35b-a3b-iq4xs"
+  "localReviewerModel": "local-qwen/qwen36-27b-mtp-iq4xs"
 }
 ```
 

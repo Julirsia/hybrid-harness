@@ -143,9 +143,41 @@ Codex package dry-run pack 검증:
 npm pack --dry-run -w qwen-harness-codex
 ```
 
-## 로컬 설치
+## 설치 / 업데이트
 
-이 checkout에 있는 최신 소스를 사용자 Pi/OpenCode/Codex 설정에 한 번에 반영하려면 저장소 루트에서 실행합니다. Pi는 user-global package로 등록되므로 작업 프로젝트마다 다시 설치하지 않아도 됩니다.
+Pi extension은 GitHub `main`을 source of truth로 설치/업데이트하는 것을 기본으로 둡니다. Git에만 업데이트를 push하는 운영에서는 npm package version보다 Git ref가 최신 여부의 기준입니다.
+
+```sh
+PI_HYBRID_HARNESS_SOURCE=git:github.com/Julirsia/hybrid-harness@main npm run update:pi
+```
+
+이미 같은 git source로 설치한 항목은 Pi에서 직접 갱신할 수도 있습니다.
+
+```sh
+pi update git:github.com/Julirsia/hybrid-harness@main
+```
+
+처음 설치하거나 특정 프로젝트에만 project-local로 설치하려면 작업 프로젝트 루트에서 실행합니다.
+
+```sh
+pi install -l git:github.com/Julirsia/hybrid-harness@main
+```
+
+태그를 만들어 push한 뒤에는 `@main` 대신 `@v0.2.10` 같은 태그 ref를 사용할 수 있습니다.
+
+현재 Pi 설정에 어떤 source가 등록되어 있는지 확인하려면:
+
+```sh
+node -e "const fs=require('fs'); const s=JSON.parse(fs.readFileSync(process.env.HOME+'/.pi/agent/settings.json','utf8')); console.log(s.packages)"
+```
+
+GitHub `main`의 최신 커밋은 다음처럼 확인합니다.
+
+```sh
+git ls-remote https://github.com/Julirsia/hybrid-harness.git refs/heads/main
+```
+
+로컬 개발 checkout을 Pi/OpenCode/Codex 설정에 한 번에 반영하려면 저장소 루트에서 실행합니다. 이 경로는 개발 중인 로컬 파일을 바로 쓰기 위한 용도이며, GitHub 최신 커밋을 자동으로 따라가지 않습니다.
 
 ```sh
 ./scripts/update-plugins.sh
@@ -158,30 +190,12 @@ npm run install:plugins
 npm run update:plugins
 ```
 
-개별 업데이트:
+개별 로컬 checkout 업데이트:
 
 ```sh
 npm run update:pi
 npm run update:opencode
 npm run update:codex
-```
-
-Pi package는 git source로도 설치/업데이트할 수 있습니다. 특정 프로젝트에만 project-local로 설치하려면 작업 프로젝트 루트에서 실행합니다.
-
-```sh
-pi install -l git:github.com/Julirsia/hybrid-harness@main
-```
-
-이미 git source로 설치한 항목은 다음처럼 갱신할 수 있습니다.
-
-```sh
-pi update git:github.com/Julirsia/hybrid-harness@main
-```
-
-태그를 만들어 push한 뒤에는 `@main` 대신 `@v0.2.10` 같은 태그 ref를 사용할 수 있습니다. `npm run update:pi`로 같은 source를 쓰려면 source를 환경 변수로 넘깁니다.
-
-```sh
-PI_HYBRID_HARNESS_SOURCE=git:github.com/Julirsia/hybrid-harness@main npm run update:pi
 ```
 
 업데이트 후에는 사용하는 host를 reload/restart합니다.
@@ -291,10 +305,13 @@ npm run test:qwen
 # Pi package dry-run pack
 npm run pack:pi
 
+# Pi extension을 GitHub main source로 업데이트
+PI_HYBRID_HARNESS_SOURCE=git:github.com/Julirsia/hybrid-harness@main npm run update:pi
+
 # Pi/OpenCode/Codex plugin 개발 checkout 업데이트
 npm run update:plugins
 
-# 개별 plugin 업데이트
+# 개별 plugin 개발 checkout 업데이트
 npm run update:pi
 npm run update:opencode
 npm run update:codex
