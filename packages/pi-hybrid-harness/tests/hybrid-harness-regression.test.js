@@ -42,6 +42,20 @@ test("event persistence stores compact metadata instead of raw tool events", () 
 	assert.doesNotMatch(block, /return event;/);
 });
 
+test("handoff import discovers sibling specs and falls back to prompt validation commands", () => {
+	assert.match(source, /function findHandoffSpecPath/);
+	const specBlock = between("function findHandoffSpecPath", "function parseHandoffValidationCommandsFromPrompt");
+	assert.match(specBlock, /manual-handoff-spec\.json/);
+	assert.match(specBlock, /rootBase\.replace\(\/-handoff\$\/i, "-spec\.json"\)/);
+	assert.match(specBlock, /siblingSpecs\.length === 1/);
+	const promptBlock = between("function parseHandoffValidationCommandsFromPrompt", "function discoverHandoff");
+	assert.match(promptBlock, /## Validation Commands/);
+	assert.match(promptBlock, /Working directory:/);
+	assert.match(promptBlock, /Expected exit:/);
+	const discoverBlock = between("const prompt = fs.readFileSync\(promptPath, \"utf8\"\);", "\t});\n\tif \(lanes.length === 0\)");
+	assert.match(discoverBlock, /specValidationCommands\.length \? specValidationCommands : parseHandoffValidationCommandsFromPrompt\(prompt\)/);
+});
+
 test("live logger does not append every live child output line to disk", () => {
 	const block = between("function createLiveLogger", "function hybridStageIcon");
 	assert.doesNotMatch(block, /appendFileSync\(\s*liveLogPath/);
@@ -665,4 +679,22 @@ test("cross-component seam criteria require executable end-to-end evidence", () 
 	assert.match(localReviewBlock, /Cross-component seam criteria/);
 	const finalBlock = between("async function runFrontierFinal", "async function runHybridOrchestration");
 	assert.match(finalBlock, /Cross-component seam criteria/);
+});
+
+test("handoff lane reviewer rejects manual-only behavioral criteria and unverified seams", () => {
+	const block = between("function handoffReviewPrompt", "type Notify");
+	assert.match(block, /is UNVERIFIED, not satisfied/);
+	assert.match(block, /manual-validation gap on a behavioral criterion is blocking/);
+	assert.match(block, /Cross-component seam criteria/);
+	assert.match(block, /PATCH vs PUT/);
+});
+
+test("handoff orchestration runs an executable integration seam gate", () => {
+	assert.match(source, /function runHandoffIntegrationGate/);
+	assert.match(source, /function parseIntegrationGateCommands/);
+	assert.match(source, /integrationCommands: HandoffValidationCommand\[\]/);
+	assert.match(source, /id: "handoff-integration"/);
+	// A multi-lane handoff with no executable gate fails instead of passing on per-lane green.
+	assert.match(source, /cross-lane seam is UNVERIFIED/);
+	assert.match(source, /runHandoffIntegrationGate\(options\.cwd, config, state, manifest, notify\)/);
 });

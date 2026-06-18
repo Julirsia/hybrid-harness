@@ -59,6 +59,9 @@ Then reload Pi:
 /hybrid-run             # resume the latest task from artifact-backed stage checkpoints
 /hybrid-run-fast <task> # token-saving mode: maxFrontierPasses forced to 1
 /hybrid-run-thorough <task> # thorough mode: maxFrontierPasses forced to 2
+/hybrid-handoff-run <dir> # import external handoff docs and run local-only lane implementation/review/repair loops
+/hybrid-handoff-resume # resume an imported external handoff from unfinished lanes
+/hybrid-handoff-status # show imported handoff lane progress
 /hybrid-monitor        # toggle live child-session output modal (F8 fallback shortcut)
 /hybrid-steer <note>    # queue parent steering for the next child session/stage boundary
 /hybrid-steering        # show queued/consumed parent steering notes
@@ -100,6 +103,19 @@ Default full run policy:
 8. APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER is written to final-review.md and run-summary.md.
 ```
 
+## External handoff mode
+
+If another agent/tool already prepared handoff documents, skip frontier scout/design and let the local model run the implementation/review/repair loop over the prepared worker prompts:
+
+```text
+/hybrid-handoff-run outputs/personal-finance-handoff
+/hybrid-monitor
+```
+
+The handoff directory should contain `manual-handoff-spec.json` when available and lane prompts at `lanes/**/05-worker-prompt.md`. The harness imports the handoff into `.pi-harness/requirements.md`, `.pi-harness/frontier-design.md`, `.pi-harness/implementation-plan.json`, `.pi-harness/progress.json`, then processes lanes in numeric order. Each lane runs in fresh Pi child sessions using the configured `localWorkerModel`; validation commands from the handoff are executed; `localReviewerModel` reviews the lane; failed validation/review triggers bounded local repair attempts. Resume with `/hybrid-handoff-resume` and inspect with `/hybrid-handoff-status`.
+
+This mode is local-only after import: it does not call the configured frontier model unless you separately run the normal frontier commands.
+
 ## Artifacts
 
 The package writes durable state to `.pi-harness/`:
@@ -121,6 +137,8 @@ The package writes durable state to `.pi-harness/`:
   plan-review.md
   requirements.md
   design-grill.md
+  handoff-manifest.json
+  handoff-review-<lane>.md
   local-log.md
   orchestration-brief.md
   user-clarifications.md

@@ -192,6 +192,37 @@ OpenCode: restart TUI
 Codex: restart session
 ```
 
+### git 주소로 Pi extension을 최신 커밋으로 업데이트 (LLM용 레시피)
+
+git 주소만 주어지면 아래 순서로 그 repo의 **최신 커밋**으로 갱신합니다. `<host>/<owner>/<repo>`를 주소에 맞게 바꾸세요(이 repo면 `github.com/Julirsia/hybrid-harness`). 단계는 결정적이라 LLM이 그대로 실행하면 됩니다. 사용하는 명령은 표준 `git`과 위에서 쓴 `pi install`/`pi update`뿐입니다.
+
+1. 어느 커밋으로 가는지 먼저 확인합니다(기본 브랜치 `main`의 최신 커밋 SHA).
+
+```sh
+git ls-remote https://<host>/<owner>/<repo> main | awk '{print $1}'
+```
+
+2. 최신 커밋으로 업데이트합니다. 브랜치 ref `@main`이 그 시점의 최신 커밋을 받아옵니다(아직 설치 전이면 `pi update` 대신 `pi install -l`).
+
+```sh
+pi update git:<host>/<owner>/<repo>@main
+```
+
+   - 정확한 커밋으로 고정(재현성·캐시 회피)하려면 tag를 push해 `@v0.2.11`처럼 tag ref를 쓰거나, 사용하는 pi 버전이 commit ref를 지원하면 `@<sha>`를 씁니다.
+
+3. host를 reload/restart 합니다(`Pi: /reload`).
+
+4. 적용 확인: 1번의 SHA와 reload 후 동작을 대조합니다. 옛 커밋이 남아 있으면 2번을 `@<sha>`(또는 tag)로 다시 실행하고 reload 합니다.
+
+복붙용(이 repo 기준):
+
+```sh
+SHA=$(git ls-remote https://github.com/Julirsia/hybrid-harness main | awk '{print $1}')
+echo "latest main commit: $SHA"
+pi update git:github.com/Julirsia/hybrid-harness@main
+echo "updated to latest main ($SHA); now run  Pi: /reload"
+```
+
 ### Pi package를 이 checkout에서 수동 전역 설치
 
 개별 CLI를 직접 실행하려면:

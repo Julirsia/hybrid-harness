@@ -269,7 +269,7 @@ interface HybridChildStats {
 interface HybridRunDetails {
 	version: 1;
 	status: "running" | "done" | "failed";
-	mode: "fast" | "default" | "thorough";
+	mode: "fast" | "default" | "thorough" | "handoff";
 	task: string;
 	startedAt: string;
 	updatedAt: string;
@@ -305,7 +305,7 @@ interface HybridRunDetails {
 
 interface HybridRunParams {
 	task?: string;
-	mode?: "fast" | "default" | "thorough";
+	mode?: "fast" | "default" | "thorough" | "handoff";
 	maxFrontierPasses?: number;
 	resume?: boolean;
 	background?: boolean;
@@ -528,7 +528,7 @@ function readHybridRunLock(
 		cwd: typeof lock.cwd === "string" ? lock.cwd : cwd,
 		task: typeof lock.task === "string" ? lock.task : "(unknown)",
 		mode:
-			lock.mode === "fast" || lock.mode === "thorough"
+			lock.mode === "fast" || lock.mode === "thorough" || lock.mode === "handoff"
 				? lock.mode
 				: "default",
 		status: "running",
@@ -2818,6 +2818,361 @@ function localWorkerPrompt(
 	].join("\n");
 }
 
+interface HandoffValidationCommand {
+	cwd?: string;
+	command: string;
+	expected_exit?: number;
+	proves?: string;
+}
+
+interface HandoffLane {
+	id: string;
+	name: string;
+	objective: string;
+	summary?: string;
+	promptPath: string;
+	prompt: string;
+	validationCommands: HandoffValidationCommand[];
+	criteria: Array<{ requirement?: string; description?: string; evidence?: string }>;
+	boundaries: Array<{ case?: string; expected?: string; evidence?: string }>;
+}
+
+interface HandoffManifest {
+	version: 1;
+	rootDir: string;
+	createdAt: string;
+	taskName: string;
+	objective: string;
+	specPath?: string;
+	readmePath?: string;
+	integrationPath?: string;
+	lanes: HandoffLane[];
+	// Executable end-to-end gate that drives the consumer against the real producer
+	// (the cross-lane seam). Per-lane unit tests + build do not prove the seam.
+	integrationCommands: HandoffValidationCommand[];
+}
+
+function handoffManifestPath(cwd: string, config: HarnessConfig): string {
+	return artifactPath(cwd, config, "handoff-manifest.json");
+}
+
+function readHandoffManifest(cwd: string, config: HarnessConfig): HandoffManifest | undefined {
+	return readJsonFile<HandoffManifest>(handoffManifestPath(cwd, config));
+}
+
+function laneNumberFromName(name: string, fallback: number): number {
+	const match = name.match(/^(\d+)/);
+	return match ? Number.parseInt(match[1], 10) : fallback;
+}
+
+function normalizeHandoffCommand(value: any): HandoffValidationCommand | undefined {
+	if (!value) return undefined;
+	if (typeof value === "string") return { command: value };
+	if (typeof value.command !== "string" || !value.command.trim()) return undefined;
+	return {
+		cwd: typeof value.cwd === "string" ? value.cwd : undefined,
+		command: value.command,
+		expected_exit: typeof value.expected_exit === "number" ? value.expected_exit : undefined,
+		proves: typeof value.proves === "string" ? value.proves : undefined,
+	};
+}
+
+function findHandoffSpecPath(rootDir: string): string | undefined {
+	const directCandidates = [
+		path.join(rootDir, "manual-handoff-spec.json"),
+		path.join(rootDir, "spec.json"),
+	];
+	for (const candidate of directCandidates) {
+		if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+	}
+	const parentDir = path.dirname(rootDir);
+	const rootBase = path.basename(rootDir);
+	const siblingBases = [
+		rootBase.replace(/-handoff$/i, "-spec.json"),
+		`${rootBase}-spec.json`,
+	];
+	for (const base of siblingBases) {
+		const candidate = path.join(parentDir, base);
+		if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+	}
+	if (!fs.existsSync(parentDir) || !fs.statSync(parentDir).isDirectory()) return undefined;
+	const siblingSpecs = fs.readdirSync(parentDir)
+		.filter((entry) => /(?:^manual-handoff-spec|-spec)\.json$/i.test(entry))
+		.map((entry) => path.join(parentDir, entry))
+		.filter((candidate) => fs.statSync(candidate).isFile());
+	return siblingSpecs.length === 1 ? siblingSpecs[0] : undefined;
+}
+
+function parseHandoffValidationCommandsFromPrompt(prompt: string): HandoffValidationCommand[] {
+	const sectionMatch = prompt.match(/## Validation Commands\s*\n([\s\S]*?)(?=\n##\s|\s*$)/i);
+	if (!sectionMatch) return [];
+	const section = sectionMatch[1];
+	const chunks = section.split(/\n(?=-\s+Working directory:)/i).filter((chunk) => chunk.trim());
+	const commands: HandoffValidationCommand[] = [];
+	for (const chunk of chunks) {
+		const codeMatch = chunk.match(/```(?:bash|sh|shell)?\s*\n([\s\S]*?)```/i);
+		if (!codeMatch?.[1]?.trim()) continue;
+		const cwd = chunk.match(/Working directory:\s*`([^`]+)`/i)?.[1];
+		const expectedExitRaw = chunk.match(/Expected exit:\s*`?(\d+)`?/i)?.[1];
+		const proves = chunk.match(/Proves:\s*([^\n]+)/i)?.[1]?.trim();
+		commands.push({
+			cwd,
+			command: codeMatch[1].trim(),
+			expected_exit: expectedExitRaw ? Number.parseInt(expectedExitRaw, 10) : undefined,
+			proves,
+		});
+	}
+	return commands;
+}
+
+// Parse the executable end-to-end gate out of integration-handoff.md (the "Executable
+// Integration Gate" / "End-to-End" section the composer renders from spec.integration_e2e).
+function parseIntegrationGateCommands(markdown: string): HandoffValidationCommand[] {
+	const sectionMatch = markdown.match(
+		/##\s+(?:Executable Integration Gate|End[- ]to[- ]End|Seam (?:Verification|Gate))[^\n]*\n([\s\S]*?)(?=\n##\s|\s*$)/i,
+	);
+	if (!sectionMatch) return [];
+	const section = sectionMatch[1];
+	const chunks = section.split(/\n(?=-\s+Working directory:)/i).filter((chunk) => chunk.trim());
+	const commands: HandoffValidationCommand[] = [];
+	for (const chunk of chunks) {
+		const codeMatch = chunk.match(/```(?:bash|sh|shell)?\s*\n([\s\S]*?)```/i);
+		if (!codeMatch?.[1]?.trim()) continue;
+		const cwd = chunk.match(/Working directory:\s*`([^`]+)`/i)?.[1];
+		const expectedExitRaw = chunk.match(/Expected exit:\s*`?(\d+)`?/i)?.[1];
+		const proves = chunk.match(/Proves:\s*([^\n]+)/i)?.[1]?.trim();
+		commands.push({
+			cwd,
+			command: codeMatch[1].trim(),
+			expected_exit: expectedExitRaw ? Number.parseInt(expectedExitRaw, 10) : undefined,
+			proves,
+		});
+	}
+	return commands;
+}
+
+function discoverHandoff(inputDir: string, cwd: string): HandoffManifest {
+	const rootDir = path.resolve(cwd, inputDir || ".");
+	if (!fs.existsSync(rootDir) || !fs.statSync(rootDir).isDirectory()) {
+		throw new Error(`Handoff directory not found: ${rootDir}`);
+	}
+	const specPath = findHandoffSpecPath(rootDir);
+	const readmePath = path.join(rootDir, "README.md");
+	const integrationPath = path.join(rootDir, "integration-handoff.md");
+	const spec = specPath ? readJsonFile<any>(specPath) : undefined;
+	const specLanes = Array.isArray(spec?.lanes) ? spec.lanes : [];
+	const promptFiles: string[] = [];
+	const walk = (dir: string) => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) walk(full);
+			else if (entry.isFile() && entry.name === "05-worker-prompt.md") promptFiles.push(full);
+		}
+	};
+	walk(rootDir);
+	promptFiles.sort((a, b) => {
+		const an = laneNumberFromName(path.basename(path.dirname(a)), Number.MAX_SAFE_INTEGER);
+		const bn = laneNumberFromName(path.basename(path.dirname(b)), Number.MAX_SAFE_INTEGER);
+		if (an !== bn) return an - bn;
+		return a.localeCompare(b);
+	});
+	const lanes: HandoffLane[] = promptFiles.map((promptPath, index) => {
+		const dirName = path.basename(path.dirname(promptPath));
+		const laneIndex = laneNumberFromName(dirName, index + 1);
+		const specLane = specLanes.find((lane: any, i: number) => {
+			const name = String(lane?.name ?? "");
+			return laneNumberFromName(name, i + 1) === laneIndex || dirName.includes(name);
+		}) ?? specLanes[index] ?? {};
+		const prompt = fs.readFileSync(promptPath, "utf8");
+		const specValidationCommands = Array.isArray(specLane.validation_commands)
+			? specLane.validation_commands.map(normalizeHandoffCommand).filter(Boolean)
+			: [];
+		return {
+			id: String(laneIndex).padStart(2, "0"),
+			name: String(specLane.name || dirName),
+			objective: String(specLane.objective || specLane.summary || dirName),
+			summary: typeof specLane.summary === "string" ? specLane.summary : undefined,
+			promptPath,
+			prompt,
+			validationCommands: specValidationCommands.length ? specValidationCommands : parseHandoffValidationCommandsFromPrompt(prompt),
+			criteria: Array.isArray(specLane.criteria) ? specLane.criteria : [],
+			boundaries: Array.isArray(specLane.boundaries) ? specLane.boundaries : [],
+		};
+	});
+	if (lanes.length === 0) {
+		throw new Error(`No lanes/**/05-worker-prompt.md files found under ${rootDir}`);
+	}
+	// The cross-lane seam is verified by an executable end-to-end gate, preferred from the
+	// spec's integration_e2e, otherwise parsed from integration-handoff.md. If neither exists
+	// for a multi-lane handoff, the seam is left UNVERIFIED and the run fails at the gate stage.
+	const integrationE2e = Array.isArray(spec?.integration_e2e)
+		? spec.integration_e2e.map(normalizeHandoffCommand).filter(Boolean) as HandoffValidationCommand[]
+		: [];
+	const integrationCommands = integrationE2e.length
+		? integrationE2e
+		: (fs.existsSync(integrationPath)
+			? parseIntegrationGateCommands(fs.readFileSync(integrationPath, "utf8"))
+			: []);
+	return {
+		version: 1,
+		rootDir,
+		createdAt: nowIso(),
+		taskName: String(spec?.task_name || path.basename(rootDir)),
+		objective: String(spec?.objective || spec?.scope_breadth || "External handoff implementation"),
+		specPath,
+		readmePath: fs.existsSync(readmePath) ? readmePath : undefined,
+		integrationPath: fs.existsSync(integrationPath) ? integrationPath : undefined,
+		lanes,
+		integrationCommands,
+	};
+}
+
+function handoffDesignMarkdown(manifest: HandoffManifest): string {
+	const readMaybe = (file: string | undefined, max: number) => {
+		if (!file || !fs.existsSync(file)) return "";
+		return truncateMiddle(fs.readFileSync(file, "utf8"), max);
+	};
+	return [
+		"# External Handoff Design Package",
+		"",
+		"This artifact was imported from externally prepared handoff documents. Frontier scout/design stages are intentionally skipped; the local harness must implement, validate, review, and repair each lane in order.",
+		"",
+		`- Handoff root: ${manifest.rootDir}`,
+		`- Task: ${manifest.taskName}`,
+		`- Objective: ${manifest.objective}`,
+		"",
+		"## Lane order",
+		...manifest.lanes.map((lane) => `- ${lane.id} ${lane.name}: ${lane.objective}`),
+		"",
+		manifest.specPath ? "## manual-handoff-spec.json" : "",
+		readMaybe(manifest.specPath, 60_000),
+		manifest.readmePath ? "## README.md" : "",
+		readMaybe(manifest.readmePath, 20_000),
+		manifest.integrationPath ? "## integration-handoff.md" : "",
+		readMaybe(manifest.integrationPath, 30_000),
+	].filter((line) => line !== "").join("\n");
+}
+
+function progressFromHandoff(manifest: HandoffManifest): HarnessProgress {
+	const criteria = manifest.lanes.flatMap((lane) => {
+		const laneCriteria = lane.criteria.length
+			? lane.criteria
+			: [{ requirement: lane.objective, evidence: "Complete lane validation commands and review." }];
+		return laneCriteria.map((criterion, index) => ({
+			id: `L${lane.id}-AC${index + 1}`,
+			description: String(criterion.requirement || criterion.description || lane.objective),
+			status: "pending" as CriterionStatus,
+			evidence: [],
+			verificationContracts: [
+				String(criterion.evidence || lane.validationCommands.map((cmd) => cmd.command).join(" && ") || "Manual review of lane output and changed files."),
+			],
+			evidenceType: lane.validationCommands.length ? "integration" as EvidenceType : "manual" as EvidenceType,
+			sourceEvidence: [],
+			runtimeEvidence: [],
+			adversarialProbes: lane.boundaries.map((b) => String(b.case || b.expected || "boundary probe")).filter(Boolean),
+			reentryProbes: [],
+			residualGaps: [],
+		}));
+	});
+	return {
+		version: 1,
+		updatedAt: nowIso(),
+		task: manifest.objective,
+		currentSliceId: `L${manifest.lanes[0]?.id ?? "01"}`,
+		slices: manifest.lanes.map((lane) => ({
+			id: `L${lane.id}`,
+			title: lane.name,
+			status: "pending" as SliceStatus,
+			evidence: [],
+			remaining: [lane.objective],
+		})),
+		acceptanceCriteria: criteria,
+		frontierRecheckTriggers: [
+			{
+				id: "HF1",
+				description: "A lane cannot be implemented without changing externally supplied acceptance criteria, forbidden paths, or dependency order.",
+				active: false,
+				evidence: "",
+			},
+		],
+		testObservations: [],
+		blockers: [],
+		nextAction: `Implement lane ${manifest.lanes[0]?.id ?? "01"} from its 05-worker-prompt.md.`,
+	};
+}
+
+function importHandoffArtifacts(cwd: string, config: HarnessConfig, state: HarnessState, manifest: HandoffManifest): void {
+	ensureStateDir(cwd, config);
+	state.task = manifest.objective;
+	state.phase = "designed";
+	state.createdAt ||= nowIso();
+	state.localWorkerModel = config.localWorkerModel;
+	state.localReviewerModel = config.localReviewerModel;
+	state.frontierModel = config.frontierModel;
+	state.frontierThinking = config.frontierThinking;
+	writeArtifact(cwd, config, state, "task.md", `# Task\n\n${manifest.objective}\n`);
+	writeArtifact(cwd, config, state, "requirements.md", handoffDesignMarkdown(manifest));
+	writeArtifact(cwd, config, state, "frontier-design.md", handoffDesignMarkdown(manifest));
+	writeArtifact(cwd, config, state, "handoff-manifest.json", JSON.stringify(manifest, null, "\t"));
+	writeArtifact(cwd, config, state, "implementation-plan.json", JSON.stringify(progressFromHandoff(manifest), null, "\t"));
+	writeProgress(cwd, config, state, progressFromHandoff(manifest));
+	saveState(cwd, config, state);
+}
+
+function handoffWorkerPrompt(manifest: HandoffManifest, lane: HandoffLane, attempt: number, config: HarnessConfig): string {
+	const repairContext = attempt > 1
+		? [
+			"",
+			"## Repair context",
+			`This is repair attempt ${attempt}. Read ${config.stateDir}/local-review.md, ${config.stateDir}/verification-summary.md, ${config.stateDir}/progress.md, and fix only the concrete lane blockers before re-running validation.`,
+		]
+		: [];
+	return [
+		"You are the LOCAL IMPLEMENTER consuming an externally prepared handoff.",
+		"Run this lane in a fresh Pi child session. Do not edit handoff source files under outputs/** or the handoff directory. Implement only in the repository paths allowed by the worker prompt.",
+		"Before relying on previous lanes, verify their accepted outputs from the current repo. Do not invent APIs or files that are not present.",
+		"When finished, report changed files, validation commands/results, adversarial or reentry probes, and remaining blockers.",
+		"",
+		`Handoff root: ${manifest.rootDir}`,
+		`Task: ${manifest.taskName}`,
+		`Lane ${lane.id}: ${lane.name}`,
+		`Objective: ${lane.objective}`,
+		...repairContext,
+		"",
+		"## Worker prompt",
+		lane.prompt,
+	].join("\n");
+}
+
+function handoffReviewPrompt(manifest: HandoffManifest, lane: HandoffLane, config: HarnessConfig): string {
+	return [
+		"You are the LOCAL REVIEWER for an externally prepared handoff lane. Review only; do not modify files.",
+		"Be strict about validation evidence, path constraints, cross-lane dependencies, and whether the lane's 05-worker-prompt.md was actually satisfied.",
+		"You may run read-only inspection and validation commands with bash, but do not edit files.",
+		"",
+		`Task: ${manifest.taskName}`,
+		`Lane ${lane.id}: ${lane.name}`,
+		`Objective: ${lane.objective}`,
+		"",
+		"Read these artifacts:",
+		`- ${config.stateDir}/requirements.md`,
+		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
+		`- ${config.stateDir}/test-evidence.md`,
+		`- ${config.stateDir}/verification-summary.md`,
+		`- ${config.stateDir}/local-log.md`,
+		`- ${config.stateDir}/git-summary.md`,
+		"",
+		"Output a fenced JSON object first, then optional markdown details. JSON schema:",
+		`{"verdict":"PASS|PASS_WITH_CONCERNS|FAIL","blockingIssues":["..."],"missingEvidence":["..."],"nonBlockingConcerns":["..."],"requiredFixes":["..."],"nextAction":"..."}`,
+		"Rules:",
+		"- PASS only when the lane is implemented, the relevant validation actually ran and passed (recorded in test-evidence.md/verification-summary.md), and no path/dependency violation is visible.",
+		"- FAIL if validation failed, evidence is missing, outputs/** or handoff files were edited, another user's accepted previous-lane behavior was broken, or the implementation skipped required behavior.",
+		"- An acceptance criterion whose only evidence is an un-executed manual audit (no recorded command output) is UNVERIFIED, not satisfied. A manual-validation gap on a behavioral criterion is blocking: if a required behavioral criterion is UNVERIFIED, return FAIL and name it in missingEvidence. Do not let 'manual audit required' or 'no automated test configured' pass the lane.",
+		"- Cross-component seam criteria (this lane's code calling another lane's interface, e.g. a client calling a server route) require integration/e2e evidence that exercises the real interface end to end; this lane's own unit tests plus a build are smoke for the seam. Confirm the consumer's verb/path/arguments match the producer's contract and that shared semantics (e.g. the meaning of now/today) agree on both sides. A PATCH vs PUT mismatch or a divergent date anchor passes each lane in isolation while the integrated app is broken.",
+		"- PASS_WITH_CONCERNS is allowed only for genuinely non-blocking documentation gaps -- never for an un-executed manual audit of behavioral acceptance, nor for an unverified cross-component seam.",
+	].join("\n");
+}
+
 type Notify = (message: string, type?: "info" | "warning" | "error") => void;
 type LiveLog = (line: string) => void;
 
@@ -3530,7 +3885,7 @@ function normalizeHybridRunDetailsForRender(
 ): HybridRunDetails | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const mode: HybridRunDetails["mode"] =
-		value.mode === "fast" || value.mode === "thorough"
+		value.mode === "fast" || value.mode === "thorough" || value.mode === "handoff"
 			? value.mode
 			: "default";
 	const task =
@@ -3666,6 +4021,26 @@ function createHybridReporter(
 	stage: (id: string, status: HybridStageStatus, summary?: string) => void;
 	setProgress: (progress: HarnessProgress | undefined) => void;
 } {
+	let lastRenderRequestAt = 0;
+	let pendingRenderRequest: ReturnType<typeof setTimeout> | undefined;
+	const requestRenderThrottled = () => {
+		if (!ctx?.ui?.requestRender) return;
+		const now = Date.now();
+		const minIntervalMs = 250;
+		const elapsed = now - lastRenderRequestAt;
+		if (elapsed >= minIntervalMs) {
+			lastRenderRequestAt = now;
+			ctx.ui.requestRender();
+			return;
+		}
+		if (pendingRenderRequest) return;
+		pendingRenderRequest = setTimeout(() => {
+			pendingRenderRequest = undefined;
+			lastRenderRequestAt = Date.now();
+			ctx.ui.requestRender?.();
+		}, minIntervalMs - elapsed);
+		pendingRenderRequest.unref?.();
+	};
 	const emit = (content?: string) => {
 		details.updatedAt = nowIso();
 		onUpdate?.({
@@ -3677,7 +4052,7 @@ function createHybridReporter(
 			],
 			details: cloneHybridDetails(details),
 		});
-		ctx?.ui?.requestRender?.();
+		requestRenderThrottled();
 	};
 	return {
 		details,
@@ -4960,7 +5335,8 @@ function startHybridBackgroundRun(options: {
 				);
 			}
 			options.onUpdate?.(result);
-			options.ctx?.ui?.requestRender?.();
+			// createHybridReporter and the monitor overlay throttle render requests;
+			// avoid an extra full-screen repaint for every child event here.
 		},
 	})
 		.then((finalDetails) => {
@@ -5012,11 +5388,113 @@ function startHybridBackgroundRun(options: {
 	return { liveId, details, promise };
 }
 
+function startHandoffBackgroundRun(options: {
+	pi: ExtensionAPI;
+	cwd: string;
+	ctx?: any;
+	handoffDir?: string;
+	resume?: boolean;
+	configOverrides?: Partial<HarnessConfig>;
+	signal?: AbortSignal;
+	onUpdate?: (result: AgentToolResult<HybridRunDetails>) => void;
+}): { liveId: string; details: HybridRunDetails; promise: Promise<HybridRunDetails> } {
+	const existing = getHybridActiveRun();
+	if (existing) throw new Error(`Hybrid run already active (${existing.liveId}). Use /hybrid-monitor or /hybrid-cancel.`);
+	const config = loadConfig(options.cwd, options.configOverrides ?? {});
+	const existingLock = readHybridRunLock(options.cwd, config);
+	if (existingLock && !isHybridRunLockStale(existingLock)) {
+		throw new Error(`Hybrid run already active (${existingLock.liveId}). Use /hybrid-monitor or /hybrid-cancel.`);
+	}
+	if (existingLock && isHybridRunLockStale(existingLock)) clearHybridRunLock(options.cwd, config, existingLock.liveId);
+	const taskPreview = options.resume
+		? readHandoffManifest(options.cwd, config)?.objective || "resume imported handoff"
+		: `handoff ${options.handoffDir || ""}`.trim();
+	const liveId = makeHybridLiveId();
+	const controller = new AbortController();
+	const store = getHybridLiveStore();
+	let version = 0;
+	const details = createHybridRunDetails(taskPreview, "handoff", config);
+	details.currentStage = "background";
+	details.recentOutput.push("Hybrid handoff run is running in the background. Use /hybrid-monitor, /hybrid-steer, or /hybrid-cancel.");
+	store.set(liveId, { version: ++version, details });
+	setLastHybridLiveId(liveId);
+	options.pi.sendMessage({
+		customType: HYBRID_RUN_MESSAGE_TYPE,
+		content: `Hybrid handoff run starting: ${taskPreview}`,
+		display: true,
+		details: { liveId, fallback: details },
+	});
+	writeHybridRunLock(options.cwd, config, {
+		version: 1,
+		liveId,
+		pid: process.pid,
+		cwd: options.cwd,
+		task: taskPreview,
+		mode: "handoff",
+		status: "running",
+		startedAt: nowIso(),
+		updatedAt: nowIso(),
+		currentStage: details.currentStage,
+	});
+	const parentAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", parentAbort, { once: true });
+	const heartbeat = setInterval(() => {
+		const lock = heartbeatHybridRunLock(options.cwd, config, liveId, details.currentStage);
+		if (lock?.cancelRequestedAt) controller.abort();
+	}, 5000);
+	heartbeat.unref?.();
+	const promise = runHandoffOrchestration({
+		cwd: options.cwd,
+		ctx: options.ctx,
+		handoffDir: options.handoffDir,
+		resume: options.resume,
+		configOverrides: options.configOverrides,
+		signal: controller.signal,
+		onUpdate: (result) => {
+			if (result.details) {
+				details.currentStage = result.details.currentStage;
+				store.set(liveId, { version: ++version, details: result.details });
+				heartbeatHybridRunLock(options.cwd, config, liveId, result.details.currentStage);
+			}
+			options.onUpdate?.(result);
+			// createHybridReporter and the monitor overlay throttle render requests;
+			// avoid an extra full-screen repaint for every child event here.
+		},
+	})
+		.then((finalDetails) => {
+			store.set(liveId, { version: ++version, details: finalDetails });
+			options.onUpdate?.({ content: [{ type: "text", text: hybridDetailsToMarkdown(finalDetails, true) }], details: finalDetails, isError: finalDetails.status === "failed" });
+			options.ctx?.ui?.requestRender?.();
+			options.ctx?.ui?.notify?.(`Hybrid handoff run ${finalDetails.status}: ${finalDetails.localVerdict ?? finalDetails.error ?? "see monitor"}`, finalDetails.status === "failed" ? "error" : "info");
+			return finalDetails;
+		})
+		.catch((error) => {
+			const failed = createHybridRunDetails(taskPreview, "handoff", config);
+			failed.status = "failed";
+			failed.finishedAt = nowIso();
+			failed.error = String(error instanceof Error ? error.message : error);
+			store.set(liveId, { version: ++version, details: failed });
+			options.onUpdate?.({ content: [{ type: "text", text: hybridDetailsToMarkdown(failed, true) }], details: failed, isError: true });
+			options.ctx?.ui?.requestRender?.();
+			options.ctx?.ui?.notify?.(`Hybrid handoff run failed: ${failed.error}`, "error");
+			return failed;
+		})
+		.finally(() => {
+			options.signal?.removeEventListener("abort", parentAbort);
+			clearInterval(heartbeat);
+			clearHybridRunLock(options.cwd, config, liveId);
+			clearHybridActiveRun(liveId);
+		});
+	setHybridActiveRun({ liveId, cwd: options.cwd, startedAt: nowIso(), controller, promise, heartbeat });
+	return { liveId, details, promise };
+}
+
 class HybridMonitorOverlayComponent implements Component {
 	private scrollOffset = 0;
 	private followTail = true;
 	private cancelArmed = false;
 	private closed = false;
+	private lastObservedVersion = -1;
 	private readonly timer: ReturnType<typeof setInterval>;
 
 	constructor(
@@ -5026,7 +5504,15 @@ class HybridMonitorOverlayComponent implements Component {
 		private readonly cwd: string,
 		private readonly done: () => void,
 	) {
-		this.timer = setInterval(() => this.tui.requestRender(), 300);
+		this.timer = setInterval(() => {
+			const snapshot = getHybridLiveStore().get(this.liveId);
+			const version = snapshot?.version ?? -1;
+			// Avoid repainting the whole overlay on a fixed cadence. Repaint only
+			// when the live store changes; child output updates already bump version.
+			if (version !== this.lastObservedVersion) {
+				this.tui.requestRender();
+			}
+		}, 1000);
 	}
 
 	invalidate(): void {}
@@ -5100,14 +5586,22 @@ class HybridMonitorOverlayComponent implements Component {
 
 	render(width: number): string[] {
 		const snapshot = getHybridLiveStore().get(this.liveId);
+		this.lastObservedVersion = snapshot?.version ?? -1;
 		const details = snapshot?.details;
 		const panelWidth = Math.max(60, Math.min(width, 120));
 		const innerW = panelWidth - 2;
 		const th = this.theme;
 		const now = Date.now();
 		const lines: string[] = [];
-		const row = (content = "") =>
-			`${th.fg("border", "│")}${truncateToWidth(normalizeTuiText(content), innerW, "…", true)}${th.fg("border", "│")}`;
+		const row = (content = "") => {
+			// Monitor rows often contain ANSI styling. Avoid cutting escape
+			// sequences while truncating; then pad by visible width so borders stay
+			// aligned with Korean/wide glyphs and color codes.
+			const normalized = normalizeTuiText(content).replace(/\n/g, " ");
+			const clipped = truncLine(normalized, innerW);
+			const padding = Math.max(0, innerW - visibleWidth(clipped));
+			return `${th.fg("border", "│")}${clipped}${" ".repeat(padding)}${th.fg("border", "│")}`;
+		};
 		const separator = () =>
 			lines.push(th.fg("border", `├${"─".repeat(innerW)}┤`));
 
@@ -5142,7 +5636,8 @@ class HybridMonitorOverlayComponent implements Component {
 		const bodyLines = compactLog.flatMap((line) =>
 			wrapTextWithAnsi(normalizeTuiText(line), bodyWidth).map((wrapped) => ` ${wrapped}`),
 		);
-		const bodyHeight = 24;
+		const terminalRows = process.stdout.rows || 40;
+		const bodyHeight = Math.max(6, Math.min(24, Math.floor(terminalRows * 0.8) - lines.length - 5));
 		const maxScroll = Math.max(0, bodyLines.length - bodyHeight);
 		if (this.followTail) {
 			this.scrollOffset = 0;
@@ -6691,6 +7186,424 @@ async function runFrontierFinal(
 	return { verdict, result: final };
 }
 
+async function runLocalHandoffReview(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	manifest: HandoffManifest,
+	lane: HandoffLane,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<{ verdict: ReturnType<typeof parseLocalVerdict>; result: PiRunResult }> {
+	notify?.(`Handoff lane ${lane.id}: local review running...`, "info");
+	writeArtifact(cwd, config, state, "git-summary.md", gitSummary(cwd, config));
+	const result = await runPiOnce({
+		cwd,
+		model: config.localReviewerModel,
+		prompt: handoffReviewPrompt(manifest, lane, config),
+		tools: ["read", "grep", "find", "ls", "bash"],
+		timeoutMs: 15 * 60_000,
+		liveLabel: `handoff-review-${lane.id}`,
+		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+		onLog: liveLog,
+	});
+	const verdict = parseLocalVerdict(result.text);
+	const report = `# Local Handoff Review — Lane ${lane.id} ${lane.name}\n\n${result.text || "(no output)"}\n\n---\n\n- ok: ${result.ok}\n- exitCode: ${result.exitCode}\n- usage: ${formatUsage(result)}\n\n\`\`\`stderr\n${truncateMiddle(result.stderr, 4000)}\n\`\`\`\n`;
+	writeArtifact(cwd, config, state, `handoff-review-${lane.id}.md`, report);
+	writeArtifact(cwd, config, state, "local-review.md", report);
+	state.phase = "local-reviewed";
+	state.lastRun = nowIso();
+	saveState(cwd, config, state);
+	return { verdict, result };
+}
+
+function runHandoffValidation(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	lane: HandoffLane,
+	notify?: Notify,
+): VerificationSummary {
+	const commands = lane.validationCommands.length
+		? lane.validationCommands
+		: verificationCommands(cwd, config).map((command) => ({ command }));
+	const results: VerificationSummary["commands"] = [];
+	const evidenceLines = [
+		readArtifact(cwd, config, "test-evidence.md") || `# Test Evidence\n\nTask: ${state.task ?? "(task missing)"}\n`,
+		"",
+		`## Handoff Lane ${lane.id} Validation`,
+		"",
+		`Generated: ${nowIso()}`,
+		"",
+	];
+	for (const command of commands) {
+		const commandCwd = command.cwd ? path.resolve(cwd, command.cwd) : cwd;
+		notify?.(`Handoff lane ${lane.id}: running ${command.command}...`, "info");
+		const test = runCommand(commandCwd, command.command, 10 * 60_000);
+		const expected = command.expected_exit ?? 0;
+		const ok = test.code === expected;
+		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, test.ok, test.code);
+		const compactOutput = test.output.replace(/\s+/g, " ").trim();
+		const summary = ok
+			? command.proves || "Command matched expected exit code."
+			: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500);
+		results.push({ command: command.command, ok, code: test.code, failureKind, summary });
+		evidenceLines.push(
+			`### ${command.command}`,
+			"",
+			`- cwd: ${commandCwd}`,
+			`- ok: ${ok}`,
+			`- code: ${test.code ?? "null"}`,
+			`- expected_exit: ${expected}`,
+			`- failureKind: ${failureKind}`,
+			command.proves ? `- proves: ${command.proves}` : "",
+			"",
+			"```",
+			truncateMiddle(test.output.trim(), 20_000),
+			"```",
+			"",
+		);
+	}
+	const summary: VerificationSummary = {
+		version: 1,
+		updatedAt: nowIso(),
+		commands: results,
+		allPassed: results.length > 0 && results.every((result) => result.ok),
+	};
+	writeArtifact(cwd, config, state, "verification-summary.json", JSON.stringify(summary, null, "\t"));
+	writeArtifact(cwd, config, state, "verification-summary.md", verificationSummaryMarkdown(summary));
+	writeArtifact(cwd, config, state, "test-evidence.md", evidenceLines.filter(Boolean).join("\n"));
+	const progress = readProgress(cwd, config, state.task ?? "(task missing)");
+	writeArtifact(cwd, config, state, "claim-evidence-matrix.md", `${claimEvidenceMatrixMarkdown(progress, summary)}\n\nMatrix columns: Evidence type | What would fail if broken | Residual gap\n`);
+	return summary;
+}
+
+// Execute the cross-lane seam end to end (the consumer driving the real producer). This is the
+// one check that catches divergences which pass every lane in isolation -- e.g. a client calling
+// PATCH while the server only implements PUT, or two endpoints anchoring "today" differently.
+function runHandoffIntegrationGate(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	manifest: HandoffManifest,
+	notify?: Notify,
+): { ran: boolean; allPassed: boolean; commandCount: number } {
+	const commands = manifest.integrationCommands ?? [];
+	const evidenceLines = [
+		readArtifact(cwd, config, "test-evidence.md") || `# Test Evidence\n\nTask: ${state.task ?? "(task missing)"}\n`,
+		"",
+		"## Handoff Integration Gate (consumer -> producer seam)",
+		"",
+		`Generated: ${nowIso()}`,
+		"",
+	];
+	if (commands.length === 0) {
+		evidenceLines.push(
+			"- NO executable integration gate was provided by this handoff. The cross-lane seam (the consumer calling the producer end to end) is UNVERIFIED: per-lane unit tests plus a build do not prove it. Add an Executable Integration Gate (spec.integration_e2e) to the integration handoff.",
+			"",
+		);
+		writeArtifact(cwd, config, state, "test-evidence.md", evidenceLines.filter(Boolean).join("\n"));
+		return { ran: false, allPassed: false, commandCount: 0 };
+	}
+	const results: VerificationSummary["commands"] = [];
+	for (const command of commands) {
+		const commandCwd = command.cwd ? path.resolve(cwd, command.cwd) : cwd;
+		notify?.(`Handoff integration gate: running ${command.command}...`, "info");
+		const test = runCommand(commandCwd, command.command, 15 * 60_000);
+		const expected = command.expected_exit ?? 0;
+		const ok = test.code === expected;
+		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, test.ok, test.code);
+		const compactOutput = test.output.replace(/\s+/g, " ").trim();
+		results.push({
+			command: command.command,
+			ok,
+			code: test.code,
+			failureKind,
+			summary: ok
+				? command.proves || "Integration gate passed."
+				: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500),
+		});
+		evidenceLines.push(
+			`### ${command.command}`,
+			"",
+			`- cwd: ${commandCwd}`,
+			`- ok: ${ok}`,
+			`- code: ${test.code ?? "null"}`,
+			`- expected_exit: ${expected}`,
+			`- failureKind: ${failureKind}`,
+			command.proves ? `- proves: ${command.proves}` : "",
+			"",
+			"```",
+			truncateMiddle(test.output.trim(), 20_000),
+			"```",
+			"",
+		);
+	}
+	writeArtifact(cwd, config, state, "test-evidence.md", evidenceLines.filter(Boolean).join("\n"));
+	return { ran: true, allPassed: results.length > 0 && results.every((result) => result.ok), commandCount: results.length };
+}
+
+function updateHandoffLaneProgress(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	lane: HandoffLane,
+	status: SliceStatus,
+	evidence: string,
+): HarnessProgress {
+	const progress = readProgress(cwd, config, state.task ?? "(task missing)");
+	progress.currentSliceId = `L${lane.id}`;
+	progress.slices = progress.slices.map((slice) =>
+		slice.id === `L${lane.id}`
+			? {
+				...slice,
+				status,
+				evidence: uniqueStrings([...slice.evidence, evidence]),
+				remaining: status === "done" ? [] : slice.remaining,
+			}
+			: slice,
+	);
+	if (status === "done") {
+		progress.acceptanceCriteria = progress.acceptanceCriteria.map((criterion) =>
+			criterion.id.startsWith(`L${lane.id}-`)
+				? {
+					...criterion,
+					status: "satisfied",
+					evidence: uniqueStrings([...criterion.evidence, evidence]),
+					runtimeEvidence: uniqueStrings([...(criterion.runtimeEvidence ?? []), evidence]),
+				}
+				: criterion,
+		);
+		const next = progress.slices.find((slice) => slice.status === "pending" || slice.status === "blocked");
+		progress.currentSliceId = next?.id ?? `L${lane.id}`;
+		progress.nextAction = next ? `Implement ${next.id}: ${next.title}` : "All handoff lanes implemented; run final summary.";
+	} else {
+		progress.nextAction = `Continue or repair lane ${lane.id}: ${lane.name}`;
+	}
+	progress.updatedAt = nowIso();
+	writeProgress(cwd, config, state, progress);
+	return progress;
+}
+
+async function runHandoffLaneLoop(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	manifest: HandoffManifest,
+	lane: HandoffLane,
+	reporter: ReturnType<typeof createHybridReporter>,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<boolean> {
+	const maxAttempts = Math.max(1, config.maxReviewRepairCycles + 1);
+	let latestVerdict: ReturnType<typeof parseLocalVerdict> = "UNKNOWN";
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		reporter.stage(`handoff-lane-${lane.id}`, "running", `attempt ${attempt}/${maxAttempts}`);
+		notify?.(`Handoff lane ${lane.id}: local worker attempt ${attempt}/${maxAttempts}...`, "info");
+		updateHandoffLaneProgress(cwd, config, state, lane, "in_progress", `attempt ${attempt} started`);
+		const worker = await runPiOnce({
+			cwd,
+			model: config.localWorkerModel,
+			prompt: handoffWorkerPrompt(manifest, lane, attempt, config),
+			timeoutMs: 30 * 60_000,
+			liveLabel: `handoff-worker-${lane.id}.${attempt}`,
+			rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+			onLog: liveLog,
+		});
+		const existingLog = readArtifact(cwd, config, "local-log.md") || `# Local Implementation Log\n\nTask: ${manifest.objective}\n`;
+		writeArtifact(
+			cwd,
+			config,
+			state,
+			"local-log.md",
+			`${existingLog}\n\n## Handoff lane ${lane.id} attempt ${attempt}\n\n${worker.text || "(no output)"}\n\n- ok: ${worker.ok}\n- exitCode: ${worker.exitCode}\n- usage: ${formatUsage(worker)}\n\n\`\`\`stderr\n${truncateMiddle(worker.stderr, 6000)}\n\`\`\`\n`,
+		);
+		writeArtifact(cwd, config, state, "git-summary.md", gitSummary(cwd, config));
+		const verification = runHandoffValidation(cwd, config, state, lane, notify);
+		await updateProgressAfterIteration(
+			cwd,
+			config,
+			state,
+			manifest.objective,
+			`handoff-${lane.id}.${attempt}`,
+			worker.text,
+			{
+				iteration: `handoff-${lane.id}.${attempt}`,
+				command: lane.validationCommands.map((cmd) => cmd.command).join(" && ") || undefined,
+				ok: verification.allPassed,
+				failureKind: verification.allPassed ? "none" : (verification.commands.find((cmd) => !cmd.ok)?.failureKind ?? "unknown"),
+				summary: verification.allPassed ? "Lane validation passed." : "One or more lane validation commands failed.",
+			},
+			notify,
+			liveLog,
+		);
+		const review = await runLocalHandoffReview(cwd, config, state, manifest, lane, notify, liveLog);
+		latestVerdict = review.verdict;
+		if (verification.allPassed && (latestVerdict === "PASS" || latestVerdict === "PASS_WITH_CONCERNS")) {
+			updateHandoffLaneProgress(cwd, config, state, lane, "done", `lane ${lane.id} validation passed and review=${latestVerdict}`);
+			reporter.stage(`handoff-lane-${lane.id}`, "done", `review=${latestVerdict}`);
+			reporter.setProgress(readProgress(cwd, config, manifest.objective));
+			return true;
+		}
+		reporter.stage(`handoff-review-${lane.id}`, "failed", `review=${latestVerdict}; validation=${verification.allPassed ? "pass" : "fail"}`);
+		updateHandoffLaneProgress(cwd, config, state, lane, "blocked", `attempt ${attempt} review=${latestVerdict}; validation=${verification.allPassed ? "pass" : "fail"}`);
+		reporter.setProgress(readProgress(cwd, config, manifest.objective));
+	}
+	reporter.stage(`handoff-lane-${lane.id}`, "failed", `review=${latestVerdict}`);
+	return false;
+}
+
+async function runHandoffFinalSummary(
+	cwd: string,
+	config: HarnessConfig,
+	state: HarnessState,
+	manifest: HandoffManifest,
+	notify?: Notify,
+	liveLog?: LiveLog,
+): Promise<PiRunResult> {
+	notify?.("Handoff final local summary running...", "info");
+	const prompt = [
+		"You are the LOCAL FINAL SUMMARIZER for an externally supplied handoff run.",
+		"Do not modify files. Summarize completion state, validation evidence, residual gaps, and next manual checks.",
+		"",
+		`Task: ${manifest.taskName}`,
+		`Objective: ${manifest.objective}`,
+		"",
+		"## Progress",
+		truncateMiddle(readArtifact(cwd, config, "progress.md"), 30_000),
+		"",
+		"## Test evidence",
+		truncateMiddle(readArtifact(cwd, config, "test-evidence.md"), 30_000),
+		"",
+		"## Reviews",
+		truncateMiddle(manifest.lanes.map((lane) => readArtifact(cwd, config, `handoff-review-${lane.id}.md`)).join("\n\n"), 40_000),
+		"",
+		"Return markdown with verdict-style summary: completed lanes, validation passed/failed, changed file areas, blockers, and recommended next command.",
+	].join("\n");
+	const result = await runPiOnce({
+		cwd,
+		model: config.localReviewerModel,
+		prompt,
+		noTools: true,
+		timeoutMs: 8 * 60_000,
+		liveLabel: "handoff-summary",
+		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
+		onLog: liveLog,
+	});
+	writeArtifact(cwd, config, state, "run-summary.md", `# Handoff Run Summary\n\n${result.text || "(no output)"}\n\n---\n\n- ok: ${result.ok}\n- exitCode: ${result.exitCode}\n- usage: ${formatUsage(result)}\n`);
+	return result;
+}
+
+async function runHandoffOrchestration(options: {
+	cwd: string;
+	ctx?: any;
+	handoffDir?: string;
+	resume?: boolean;
+	configOverrides?: Partial<HarnessConfig>;
+	signal?: AbortSignal;
+	onUpdate?: (result: AgentToolResult<HybridRunDetails>) => void;
+}): Promise<HybridRunDetails> {
+	const config = loadConfig(options.cwd, options.configOverrides ?? {});
+	ensureStateDir(options.cwd, config);
+	try { fs.writeFileSync(artifactPath(options.cwd, config, "events.jsonl"), "", "utf8"); } catch {}
+	let state = loadState(options.cwd, config);
+	const manifest = options.resume
+		? readHandoffManifest(options.cwd, config)
+		: discoverHandoff(options.handoffDir || "", options.cwd);
+	if (!manifest) throw new Error("No imported handoff manifest found. Run /hybrid-handoff-run <dir> first.");
+	if (!options.resume) {
+		cleanRunArtifacts(options.cwd, config);
+		state = {
+			version: 1,
+			phase: "idle",
+			updatedAt: nowIso(),
+			task: manifest.objective,
+			createdAt: nowIso(),
+			localWorkerModel: config.localWorkerModel,
+			localReviewerModel: config.localReviewerModel,
+			frontierModel: config.frontierModel,
+			frontierThinking: config.frontierThinking,
+			artifacts: {},
+		};
+		importHandoffArtifacts(options.cwd, config, state, manifest);
+	}
+	state.task = manifest.objective;
+	saveState(options.cwd, config, state);
+	const details = createHybridRunDetails(manifest.objective, "handoff", config);
+	details.stages = [
+		{ id: "checkpoint", label: "Pre-run checkpoint", status: "pending" },
+		{ id: "handoff-import", label: "Import external handoff", status: options.resume ? "skipped" : "pending" },
+		...manifest.lanes.flatMap((lane) => [
+			{ id: `handoff-lane-${lane.id}`, label: `Lane ${lane.id}: ${lane.name}`, status: "pending" as HybridStageStatus },
+			{ id: `handoff-review-${lane.id}`, label: `Review ${lane.id}: ${lane.name}`, status: "pending" as HybridStageStatus },
+		]),
+		{ id: "handoff-integration", label: "Integration seam gate", status: "pending" },
+		{ id: "summary", label: "Local final summary", status: "pending" },
+	];
+	const reporter = createHybridReporter(details, options.onUpdate, options.ctx);
+	const notify: Notify = (message, type = "info") => {
+		options.ctx?.ui?.notify?.(message, type);
+		reporter.log(`[notice] ${message}`);
+	};
+	const baseLiveLog = createLiveLogger(options.cwd, config, state, options.ctx);
+	const liveLog: LiveLog = (line) => { baseLiveLog(line); reporter.log(line); };
+	(liveLog as any).onEvent = (label: string, event: any) => reporter.childEvent(label, event);
+	(liveLog as any).signal = options.signal ?? options.ctx?.signal;
+	try {
+		reporter.stage("checkpoint", "running", "Creating git checkpoint before handoff edits");
+		const checkpoint = createGitCheckpoint(options.cwd, config, `pre-handoff-${manifest.taskName.slice(0, 40)}`);
+		reporter.stage("checkpoint", "done", checkpoint ?? "Skipped: not a git repository or unavailable");
+		if (!options.resume) reporter.stage("handoff-import", "done", `${manifest.lanes.length} lane(s) imported`);
+		reporter.setProgress(readProgress(options.cwd, config, manifest.objective));
+		for (const lane of manifest.lanes) {
+			const progress = readProgress(options.cwd, config, manifest.objective);
+			const existing = progress.slices.find((slice) => slice.id === `L${lane.id}`);
+			if (options.resume && existing?.status === "done") {
+				reporter.stage(`handoff-lane-${lane.id}`, "skipped", "already done");
+				continue;
+			}
+			const ok = await runHandoffLaneLoop(options.cwd, config, state, manifest, lane, reporter, notify, liveLog);
+			if (!ok) throw new Error(`Handoff lane ${lane.id} failed after repair loop. See ${config.stateDir}/handoff-review-${lane.id}.md`);
+		}
+		// Executable seam gate: per-lane green does not prove the consumer<->producer integration.
+		// A multi-lane handoff must drive the consumer against the real producer end to end.
+		if (manifest.lanes.length >= 2) {
+			reporter.stage("handoff-integration", "running", "Running executable integration gate (consumer -> producer seam)");
+			const integration = runHandoffIntegrationGate(options.cwd, config, state, manifest, notify);
+			if (!integration.ran) {
+				reporter.stage("handoff-integration", "failed", "no executable integration gate; cross-lane seam UNVERIFIED");
+				throw new Error(
+					"Handoff has no executable integration gate, so the cross-lane seam is UNVERIFIED (per-lane unit tests + build do not prove it). Add an Executable Integration Gate (integration_e2e) that drives the consumer against the real producer.",
+				);
+			}
+			if (!integration.allPassed) {
+				reporter.stage("handoff-integration", "failed", `integration gate failed (${integration.commandCount} command(s))`);
+				throw new Error(`Handoff integration gate failed; the consumer<->producer seam is broken. See ${config.stateDir}/test-evidence.md`);
+			}
+			reporter.stage("handoff-integration", "done", `${integration.commandCount} integration command(s) passed`);
+		} else {
+			reporter.stage("handoff-integration", "skipped", "single-lane handoff; no cross-lane seam");
+		}
+		reporter.stage("summary", "running", "Generating local final summary");
+		await runHandoffFinalSummary(options.cwd, config, state, manifest, notify, liveLog);
+		reporter.stage("summary", "done", "handoff complete");
+		details.status = "done";
+		details.finishedAt = nowIso();
+		details.localVerdict = "PASS";
+		details.artifacts = { ...state.artifacts };
+		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
+		writeArtifact(options.cwd, config, state, "usage-summary.md", details.usageSummary);
+		saveState(options.cwd, config, state);
+		reporter.setProgress(readProgress(options.cwd, config, manifest.objective));
+		return details;
+	} catch (error) {
+		details.status = "failed";
+		details.finishedAt = nowIso();
+		details.error = error instanceof Error ? error.message : String(error);
+		return details;
+	}
+}
+
 async function runHybridOrchestration(options: {
 	cwd: string;
 	ctx?: any;
@@ -8111,6 +9024,17 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 						reason: `Hybrid safety guard blocked ${event.toolName} to protected path ${candidate} (matched ${matched}).`,
 					};
 				}
+				const manifest = readHandoffManifest(ctx.cwd, config);
+				if (manifest?.rootDir) {
+					const target = path.resolve(ctx.cwd, candidate);
+					const root = path.resolve(manifest.rootDir);
+					if (target === root || target.startsWith(`${root}${path.sep}`)) {
+						return {
+							block: true,
+							reason: `Hybrid handoff safety guard blocked ${event.toolName} to handoff source path ${candidate}. Handoff documents are read-only inputs.`,
+						};
+					}
+				}
 			}
 		}
 
@@ -8149,7 +9073,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				},
 				mode: {
 					type: "string",
-					enum: ["fast", "default", "thorough"],
+					enum: ["fast", "default", "thorough", "handoff"],
 					description: "fast=1 frontier pass, thorough=2 frontier passes",
 				},
 				maxFrontierPasses: {
@@ -8478,6 +9402,77 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		description:
 			"Resume the current hybrid task from the last incomplete stage",
 		handler: async (_args, ctx) => handleHybridRun("", ctx, {}, "default"),
+	});
+
+	pi.registerCommand("hybrid-handoff-run", {
+		description:
+			"Import externally prepared handoff docs and run local-only lane implementation/review/repair loops",
+		handler: async (args, ctx) => {
+			const handoffDir = args.trim();
+			if (!handoffDir) {
+				ctx.ui.notify("Usage: /hybrid-handoff-run <handoff-dir>", "warning");
+				return;
+			}
+			try {
+				const { liveId } = startHandoffBackgroundRun({ pi, cwd: ctx.cwd, ctx, handoffDir });
+				ctx.ui.notify(
+					`Hybrid handoff run started in background (${liveId}). Use /hybrid-monitor, /hybrid-handoff-status, or /hybrid-cancel.`,
+					"info",
+				);
+				ctx.ui.requestRender?.();
+			} catch (error) {
+				ctx.ui.notify(`Hybrid handoff run failed to start: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("hybrid-handoff-resume", {
+		description: "Resume the imported handoff run from unfinished lanes",
+		handler: async (_args, ctx) => {
+			try {
+				const { liveId } = startHandoffBackgroundRun({ pi, cwd: ctx.cwd, ctx, resume: true });
+				ctx.ui.notify(
+					`Hybrid handoff resume started in background (${liveId}). Use /hybrid-monitor or /hybrid-cancel.`,
+					"info",
+				);
+				ctx.ui.requestRender?.();
+			} catch (error) {
+				ctx.ui.notify(`Hybrid handoff resume failed to start: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("hybrid-handoff-status", {
+		description: "Show imported handoff manifest, lane progress, and active run state",
+		handler: async (_args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			const state = loadState(ctx.cwd, config);
+			const manifest = readHandoffManifest(ctx.cwd, config);
+			const progress = readProgress(ctx.cwd, config, state.task ?? manifest?.objective ?? "(task missing)");
+			const activeLock = readHybridRunLock(ctx.cwd, config);
+			const report = [
+				"# Hybrid Handoff Status",
+				"",
+				manifest ? `- Handoff root: \`${manifest.rootDir}\`` : "- Handoff root: not imported",
+				manifest ? `- Task: ${manifest.taskName}` : "",
+				manifest ? `- Lanes: ${manifest.lanes.length}` : "",
+				activeLock ? `- Active run: ${activeLock.liveId} stage=${activeLock.currentStage ?? "unknown"}` : "- Active run: none",
+				"",
+				"## Lanes",
+				...(manifest?.lanes.length
+					? manifest.lanes.map((lane) => {
+						const slice = progress.slices.find((candidate) => candidate.id === `L${lane.id}`);
+						return `- ${lane.id} ${lane.name}: ${slice?.status ?? "pending"}`;
+					})
+					: ["- none"]),
+				"",
+				"## Progress",
+				progressToMarkdown(progress),
+			].filter(Boolean).join("\n");
+			setStatusWidget(ctx, report);
+			await showReport("Hybrid Handoff Status", report, ctx);
+			ctx.ui.notify("Hybrid handoff status generated.", "info");
+		},
 	});
 
 	pi.registerCommand("hybrid-new", {
