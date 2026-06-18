@@ -61,6 +61,13 @@ interface HarnessConfig {
 	 * sufficient evidence of actual runtime behavior.
 	 */
 	requireDeterministicTestsForInteractive: boolean;
+	/**
+	 * When true, a multi-lane handoff with NO executable integration gate hard-fails the run.
+	 * When false (default), a missing gate does not crash the run: it finishes with a loud
+	 * "seam UNVERIFIED" concern (localVerdict PASS_WITH_CONCERNS) instead. A gate that exists
+	 * but FAILS always fails the run regardless of this flag.
+	 */
+	requireIntegrationGate: boolean;
 }
 
 interface HarnessState {
@@ -383,6 +390,7 @@ const DEFAULT_CONFIG: HarnessConfig = {
 	verificationCommands: [],
 	allowManifestReviewWhenNoGit: true,
 	requireDeterministicTestsForInteractive: true,
+	requireIntegrationGate: false,
 };
 
 function nowIso(): string {
@@ -7566,21 +7574,33 @@ async function runHandoffOrchestration(options: {
 			if (!ok) throw new Error(`Handoff lane ${lane.id} failed after repair loop. See ${config.stateDir}/handoff-review-${lane.id}.md`);
 		}
 		// Executable seam gate: per-lane green does not prove the consumer<->producer integration.
-		// A multi-lane handoff must drive the consumer against the real producer end to end.
+		// A multi-lane handoff should drive the consumer against the real producer end to end.
+		// A MISSING gate does not crash the run (that would brick every handoff authored before
+		// integration_e2e existed) -- it finishes with a loud "seam UNVERIFIED" concern unless
+		// requireIntegrationGate enforces strict mode. A gate that EXISTS but FAILS always fails.
+		let seamUnverified = false;
 		if (manifest.lanes.length >= 2) {
 			reporter.stage("handoff-integration", "running", "Running executable integration gate (consumer -> producer seam)");
 			const integration = runHandoffIntegrationGate(options.cwd, config, state, manifest, notify);
 			if (!integration.ran) {
-				reporter.stage("handoff-integration", "failed", "no executable integration gate; cross-lane seam UNVERIFIED");
-				throw new Error(
-					"Handoff has no executable integration gate, so the cross-lane seam is UNVERIFIED (per-lane unit tests + build do not prove it). Add an Executable Integration Gate (integration_e2e) that drives the consumer against the real producer.",
+				if (config.requireIntegrationGate) {
+					reporter.stage("handoff-integration", "failed", "no executable integration gate; cross-lane seam UNVERIFIED (strict)");
+					throw new Error(
+						"Handoff has no executable integration gate, so the cross-lane seam is UNVERIFIED (per-lane unit tests + build do not prove it). Add an Executable Integration Gate (integration_e2e) that drives the consumer against the real producer, or unset requireIntegrationGate.",
+					);
+				}
+				seamUnverified = true;
+				notify?.(
+					"No executable integration gate found; the cross-lane seam is UNVERIFIED. Add integration_e2e to verify it end to end (set requireIntegrationGate to enforce).",
+					"warning",
 				);
-			}
-			if (!integration.allPassed) {
+				reporter.stage("handoff-integration", "skipped", "no executable integration gate — cross-lane seam UNVERIFIED (add integration_e2e; requireIntegrationGate to enforce)");
+			} else if (!integration.allPassed) {
 				reporter.stage("handoff-integration", "failed", `integration gate failed (${integration.commandCount} command(s))`);
 				throw new Error(`Handoff integration gate failed; the consumer<->producer seam is broken. See ${config.stateDir}/test-evidence.md`);
+			} else {
+				reporter.stage("handoff-integration", "done", `${integration.commandCount} integration command(s) passed`);
 			}
-			reporter.stage("handoff-integration", "done", `${integration.commandCount} integration command(s) passed`);
 		} else {
 			reporter.stage("handoff-integration", "skipped", "single-lane handoff; no cross-lane seam");
 		}
@@ -7589,7 +7609,7 @@ async function runHandoffOrchestration(options: {
 		reporter.stage("summary", "done", "handoff complete");
 		details.status = "done";
 		details.finishedAt = nowIso();
-		details.localVerdict = "PASS";
+		details.localVerdict = seamUnverified ? "PASS_WITH_CONCERNS" : "PASS";
 		details.artifacts = { ...state.artifacts };
 		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
 		writeArtifact(options.cwd, config, state, "usage-summary.md", details.usageSummary);

@@ -698,3 +698,18 @@ test("handoff orchestration runs an executable integration seam gate", () => {
 	assert.match(source, /cross-lane seam is UNVERIFIED/);
 	assert.match(source, /runHandoffIntegrationGate\(options\.cwd, config, state, manifest, notify\)/);
 });
+
+test("missing integration gate is non-fatal (warn) but configurable to strict", () => {
+	// New config flag + default off.
+	assert.match(source, /requireIntegrationGate: boolean;/);
+	assert.match(source, /requireIntegrationGate: false,/);
+	// Missing gate: strict throws; otherwise mark seam unverified and continue (no crash).
+	const orch = between("// Executable seam gate:", "reporter.stage(\"summary\"");
+	assert.match(orch, /if \(config\.requireIntegrationGate\)/);          // strict branch
+	assert.match(orch, /seamUnverified = true;/);                          // non-strict: continue
+	assert.match(orch, /"handoff-integration", "skipped"/);                // non-strict: not "failed"
+	// A failing gate (exists but fails) still throws regardless of the flag.
+	assert.match(orch, /integration gate failed; the consumer<->producer seam is broken/);
+	// Verdict is downgraded (not a clean PASS) when the seam is unverified.
+	assert.match(source, /seamUnverified \? "PASS_WITH_CONCERNS" : "PASS"/);
+});
