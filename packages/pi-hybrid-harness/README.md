@@ -13,7 +13,7 @@ The goal is to spend frontier-model tokens on high-leverage design and quality g
 - State directory: `.pi-harness/`
 - Local endpoint: `http://192.168.0.44:8080/v1`
 - Local worker: `local-qwen/qwen36-27b-mtp-iq4xs`
-- Local reviewer: `local-qwen/qwen36-27b-mtp-iq4xs`
+- Local reviewer: `local-qwen/qwen36-35b-a3b-iq4xs`
 - Frontier: `openai-codex/gpt-5.5` with `high` thinking
 
 The extension dynamically registers a `local-qwen` provider from the llama.cpp `/v1/models` endpoint. It also registers a `hybrid_run` custom tool with compact/expanded Pi TUI rendering for live harness progress.
@@ -184,7 +184,7 @@ Create `.pi-harness/config.json`:
   "frontierModel": "openai-codex/gpt-5.5",
   "frontierThinking": "high",
   "localWorkerModel": "local-qwen/qwen36-27b-mtp-iq4xs",
-  "localReviewerModel": "local-qwen/qwen36-27b-mtp-iq4xs"
+  "localReviewerModel": "local-qwen/qwen36-35b-a3b-iq4xs"
 }
 ```
 

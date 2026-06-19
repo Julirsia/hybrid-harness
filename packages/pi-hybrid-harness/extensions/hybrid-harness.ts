@@ -359,7 +359,7 @@ const DEFAULT_CONFIG: HarnessConfig = {
 	localProvider: "local-qwen",
 	localApiKey: "local",
 	localWorkerModel: "local-qwen/qwen36-27b-mtp-iq4xs",
-	localReviewerModel: "local-qwen/qwen36-27b-mtp-iq4xs",
+	localReviewerModel: "local-qwen/qwen36-35b-a3b-iq4xs",
 	frontierModel: "openai-codex/gpt-5.5",
 	frontierThinking: "high",
 	frontierInputCostPerMTok: 0,

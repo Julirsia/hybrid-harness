@@ -22,6 +22,12 @@ function assertOrder(block, firstNeedle, secondNeedle) {
 	assert.ok(first < second, `expected ${firstNeedle} before ${secondNeedle}`);
 }
 
+test("default local reviewer uses the 35B model while the worker remains 27B", () => {
+	const block = between("const DEFAULT_CONFIG", "function statePath");
+	assert.match(block, /localWorkerModel: "local-qwen\/qwen36-27b-mtp-iq4xs"/);
+	assert.match(block, /localReviewerModel: "local-qwen\/qwen36-35b-a3b-iq4xs"/);
+});
+
 test("report overlays use the custom UI whenever interactive UI is available", () => {
 	const block = between("const showReport = async", "let activeHybridMonitorClose");
 	assert.match(block, /if \(ctx\?\.hasUI && ctx\?\.ui\?\.custom\) \{/);
