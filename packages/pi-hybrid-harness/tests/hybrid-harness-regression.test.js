@@ -165,10 +165,49 @@ test("finishing step records structured verification summary and syncs state art
 	assert.match(source, /verificationCommands: string\[\]/);
 	assert.match(source, /function runVerificationSummary/);
 	assert.match(source, /"verification-summary.json"/);
-	assert.match(source, /const failureKind: TestFailureKind = test\.ok\s*\?\s*"none"\s*:\s*classifyTestFailure/);
+	assert.match(source, /const evaluated = verificationCommandPassed\(test\)/);
+	assert.match(source, /const failureKind: TestFailureKind = evaluated\.ok/);
 	assert.match(source, /function syncHarnessArtifacts/);
 	assert.match(source, /"test-evidence.md"/);
 	assert.match(source, /state\.phase = "implemented"/);
+});
+
+test("verification rejects false-green runtime output and includes lint", () => {
+	assert.match(source, /function fatalVerificationSignals/);
+	assert.match(source, /EADDRINUSE/);
+	assert.match(source, /function verificationCommandPassed/);
+	assert.match(source, /fatalSignals\.length === 0/);
+	const inferBlock = between("function inferVerificationCommands", "function verificationCommands");
+	assert.match(inferBlock, /scripts\.lint/);
+	assert.match(inferBlock, /npm run lint/);
+	const integrationBlock = between("function runHandoffIntegrationGate", "function updateHandoffLaneProgress");
+	assert.match(integrationBlock, /verificationCommandPassed\(test, expected\)/);
+});
+
+test("handoff completion requires an approving frontier final gate", () => {
+	const block = between("async function runHandoffOrchestration", "async function runHybridOrchestration");
+	assert.match(block, /id: "handoff-verification"/);
+	assert.match(block, /id: "handoff-frontier-final"/);
+	assert.match(block, /runVerificationSummary\(options\.cwd, config, state, notify\)/);
+	assert.match(block, /runFrontierFinal\(options\.cwd, config, state, notify, liveLog\)/);
+	assert.match(block, /final\.verdict !== "APPROVE"/);
+	assert.match(block, /Frontier final gate rejected handoff completion/);
+	assert.match(block, /details\.frontierVerdict = final\.verdict/);
+});
+
+test("generic hybrid run never reports done after a rejected frontier verdict", () => {
+	const block = between("async function runHybridOrchestration", "export default async function hybridHarness");
+	assert.match(block, /const frontierApproved = finalVerdict === "APPROVE"/);
+	assert.match(block, /details\.status = frontierApproved \? "done" : "failed"/);
+	assert.match(block, /markHybridRunStage\([\s\S]*?"summary",[\s\S]*?frontierApproved \? "done" : "failed"/);
+});
+
+test("frontier final receives canonical task tracking status", () => {
+	assert.match(source, /function canonicalTaskTrackingMarkdown/);
+	const finalBlock = between("async function runFrontierFinal", "async function runLocalHandoffReview");
+	assert.match(finalBlock, /Canonical task tracking/);
+	assert.match(finalBlock, /canonicalTaskTrackingMarkdown\(cwd\)/);
+	assert.match(finalBlock, /unchecked required task/);
 });
 
 test("non-git workspaces use manifest review policy instead of permanent active FR blocker", () => {

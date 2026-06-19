@@ -112,9 +112,9 @@ If another agent/tool already prepared handoff documents, skip frontier scout/de
 /hybrid-monitor
 ```
 
-The handoff directory should contain `manual-handoff-spec.json` when available and lane prompts at `lanes/**/05-worker-prompt.md`. The harness imports the handoff into `.pi-harness/requirements.md`, `.pi-harness/frontier-design.md`, `.pi-harness/implementation-plan.json`, `.pi-harness/progress.json`, then processes lanes in numeric order. Each lane runs in fresh Pi child sessions using the configured `localWorkerModel`; validation commands from the handoff are executed; `localReviewerModel` reviews the lane; failed validation/review triggers bounded local repair attempts. Resume with `/hybrid-handoff-resume` and inspect with `/hybrid-handoff-status`.
+The handoff directory should contain `manual-handoff-spec.json` when available and lane prompts at `lanes/**/05-worker-prompt.md`. The harness imports the handoff into `.pi-harness/requirements.md`, `.pi-harness/frontier-design.md`, `.pi-harness/implementation-plan.json`, `.pi-harness/progress.json`, then processes lanes in numeric order. Each lane runs in fresh Pi child sessions using the configured `localWorkerModel`; validation commands from the handoff are executed; `localReviewerModel` reviews the lane; failed validation/review triggers bounded local repair attempts. After all lanes, the harness reruns inferred verification commands and calls the configured frontier model for the final gate. Only `APPROVE` marks the handoff complete. Resume with `/hybrid-handoff-resume` and inspect with `/hybrid-handoff-status`.
 
-This mode is local-only after import: it does not call the configured frontier model unless you separately run the normal frontier commands.
+Implementation and repair remain local after import; the frontier model is reserved for the final shipping decision.
 
 ## Artifacts
 
@@ -193,6 +193,8 @@ Create `.pi-harness/config.json`:
 For browser/UI/game/canvas/touch-style tasks, `requireDeterministicTestsForInteractive` defaults to `true`. With this policy enabled, syntax checks, HTTP 200 checks, screenshots without assertions, and worker self-reported smoke tests are not enough for PASS/APPROVE. Configure `testCommand` to run objective runtime assertions (for example an agent-browser or Node harness script that checks game state/DOM/canvas behavior), or the local/final gates will request changes instead of approving.
 
 For all non-trivial tasks, the harness records acceptance criteria as executable verification contracts. Final evidence separates source evidence from runtime evidence and writes `claim-evidence-matrix.md` with Claim, Evidence command, Evidence type, What would fail if broken, and Residual gap.
+
+Inferred verification includes a root `lint` script when present. A zero exit code is rejected when output still contains a fatal runtime signal such as `EADDRINUSE`, preventing stale or conflicting processes from producing false-green E2E results. The final gate also receives canonical `specs/**/tasks.md` checkbox status; unchecked required task IDs block completion when the objective claims that tracker is complete.
 
 For ambiguous requirements or broad designs, use `/hybrid-interview` and `/hybrid-grill` before implementation. These are frontier-owned design gates: they run with `frontierModel` and `frontierThinking`, write `requirements.md` and `design-grill.md`, and do not assign implementation to local/Qwen until the requirement or design branch is ready.
 

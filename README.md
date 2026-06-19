@@ -163,7 +163,7 @@ pi update git:github.com/Julirsia/hybrid-harness@main
 pi install -l git:github.com/Julirsia/hybrid-harness@main
 ```
 
-태그를 만들어 push한 뒤에는 `@main` 대신 `@v0.2.10` 같은 태그 ref를 사용할 수 있습니다.
+태그를 만들어 push한 뒤에는 `@main` 대신 `@v0.2.11` 같은 태그 ref를 사용할 수 있습니다.
 
 현재 Pi 설정에 어떤 source가 등록되어 있는지 확인하려면:
 

@@ -1615,6 +1615,33 @@ function runCommand(
 	};
 }
 
+const FATAL_VERIFICATION_PATTERNS: Array<{
+	label: string;
+	pattern: RegExp;
+}> = [
+	{ label: "address already in use (EADDRINUSE)", pattern: /\bEADDRINUSE\b|address already in use/i },
+	{ label: "unhandled promise rejection", pattern: /UnhandledPromiseRejection/i },
+	{ label: "fatal runtime error", pattern: /^\s*(?:FATAL(?: ERROR)?|Fatal error:)\b/im },
+	{ label: "test timeout", pattern: /Test timeout of \d+ms exceeded/i },
+];
+
+function fatalVerificationSignals(output: string): string[] {
+	return FATAL_VERIFICATION_PATTERNS
+		.filter(({ pattern }) => pattern.test(output))
+		.map(({ label }) => label);
+}
+
+function verificationCommandPassed(
+	result: { ok: boolean; output: string; code: number | null },
+	expectedExit = 0,
+): { ok: boolean; fatalSignals: string[] } {
+	const fatalSignals = fatalVerificationSignals(result.output);
+	return {
+		ok: result.code === expectedExit && fatalSignals.length === 0,
+		fatalSignals,
+	};
+}
+
 function uniqueStrings(values: string[]): string[] {
 	return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
@@ -1639,6 +1666,9 @@ function inferVerificationCommands(cwd: string): string[] {
 	}
 	if (fs.existsSync(path.join(cwd, "tsconfig.json"))) {
 		commands.push("npx tsc --noEmit");
+	}
+	if (scripts.lint) {
+		commands.push("npm run lint");
 	}
 	if (scripts.build) {
 		commands.push("npm run build");
@@ -1753,16 +1783,19 @@ function runVerificationSummary(
 	for (const command of commands) {
 		notify?.(`Hybrid finish: running ${command}...`, "info");
 		const test = runCommand(cwd, command, 10 * 60_000);
-		const failureKind: TestFailureKind = test.ok
+		const evaluated = verificationCommandPassed(test);
+		const failureKind: TestFailureKind = evaluated.ok
 			? "none"
-			: classifyTestFailure(test.output, test.ok, test.code);
+			: classifyTestFailure(test.output, false, test.code);
 		const compactOutput = test.output.replace(/\s+/g, " ").trim();
-		const summary = test.ok
+		const summary = evaluated.ok
 			? "Command passed."
-			: truncateMiddle(compactOutput || "Command failed without output.", 500);
+			: evaluated.fatalSignals.length
+				? `Command emitted fatal runtime signal(s): ${evaluated.fatalSignals.join(", ")}.`
+				: truncateMiddle(compactOutput || "Command failed without output.", 500);
 		results.push({
 			command,
-			ok: test.ok,
+			ok: evaluated.ok,
 			code: test.code,
 			failureKind,
 			summary,
@@ -1770,7 +1803,7 @@ function runVerificationSummary(
 		evidenceLines.push(
 			`### ${command}`,
 			"",
-			`- ok: ${test.ok}`,
+			`- ok: ${evaluated.ok}`,
 			`- code: ${test.code ?? "null"}`,
 			`- failureKind: ${failureKind}`,
 			"",
@@ -7085,6 +7118,40 @@ async function runLocalReview(
 	return { verdict, result: review };
 }
 
+function canonicalTaskTrackingMarkdown(cwd: string): string {
+	const specsDir = path.join(cwd, "specs");
+	if (!fs.existsSync(specsDir)) return "No canonical specs/**/tasks.md files found.";
+	const taskFiles: string[] = [];
+	const visit = (dir: string): void => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			if (entry.isSymbolicLink()) continue;
+			const fullPath = path.join(dir, entry.name);
+			if (entry.isDirectory()) visit(fullPath);
+			else if (entry.isFile() && entry.name === "tasks.md") taskFiles.push(fullPath);
+		}
+	};
+	try {
+		visit(specsDir);
+	} catch (error) {
+		return `Unable to inspect canonical task tracking: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	if (taskFiles.length === 0) return "No canonical specs/**/tasks.md files found.";
+	const lines = ["Canonical task tracking is authoritative when the objective references its task IDs or checklist completion.", ""];
+	for (const taskFile of taskFiles.sort()) {
+		const taskLines = fs.readFileSync(taskFile, "utf8").split(/\r?\n/);
+		const tasks = taskLines.flatMap((line) => {
+			const match = line.match(/^\s*-\s*\[([ xX])\]\s+(T\d+)\b/);
+			return match ? [{ id: match[2], complete: match[1].toLowerCase() === "x" }] : [];
+		});
+		const unchecked = tasks.filter((task) => !task.complete).map((task) => task.id);
+		lines.push(
+			`- ${path.relative(cwd, taskFile)}: ${tasks.length - unchecked.length}/${tasks.length} checked`,
+			`  - unchecked required task IDs: ${unchecked.length ? unchecked.join(", ") : "none"}`,
+		);
+	}
+	return lines.join("\n");
+}
+
 async function runFrontierFinal(
 	cwd: string,
 	config: HarnessConfig,
@@ -7118,6 +7185,9 @@ async function runFrontierFinal(
 		"## Structured progress",
 		truncateMiddle(readArtifact(cwd, config, "progress.md"), 30_000),
 		"",
+		"## Canonical task tracking",
+		canonicalTaskTrackingMarkdown(cwd),
+		"",
 		"## Test evidence",
 		truncateMiddle(readArtifact(cwd, config, "test-evidence.md"), 30_000),
 		"",
@@ -7149,6 +7219,7 @@ async function runFrontierFinal(
 		"- REQUEST_CHANGES: local worker should fix concrete issues.",
 		"- ESCALATE_TO_USER: requirement/design ambiguity or risk requires user decision.",
 		"Final-gate evidence rules:",
+		"- If the objective claims explicit task IDs or checklist completion, any unchecked required task is blocking unless the task document explicitly marks it optional or superseded.",
 		"- For EACH acceptance criterion, map it to concrete evidence from test-evidence.md, local-log.md command output, or git diff. If any acceptance criterion lacks evidence, REQUEST_CHANGES.",
 		"- An acceptance criterion whose only evidence is an un-executed manual audit (no recorded command output) is UNVERIFIED, not satisfied: 'manual audit required' or 'no automated test configured' must not roll up to APPROVE. If any required behavioral criterion is UNVERIFIED, REQUEST_CHANGES (or ESCALATE_TO_USER) and name it in missing evidence.",
 		"- Cross-component seam criteria (a consumer calling a producer across slices/lanes/modules, e.g. a client calling a server route) require integration or e2e evidence that exercises the real interface end to end; per-component unit tests plus a build are smoke for the seam. Confirm the consumer's verb/path/arguments match the producer's registered contract and that shared semantics (e.g. the meaning of now/today) agree on both sides; a PATCH vs PUT or divergent date anchor passes both sides in isolation while the running app is broken.",
@@ -7249,12 +7320,15 @@ function runHandoffValidation(
 		notify?.(`Handoff lane ${lane.id}: running ${command.command}...`, "info");
 		const test = runCommand(commandCwd, command.command, 10 * 60_000);
 		const expected = command.expected_exit ?? 0;
-		const ok = test.code === expected;
-		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, test.ok, test.code);
+		const evaluated = verificationCommandPassed(test, expected);
+		const ok = evaluated.ok;
+		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, false, test.code);
 		const compactOutput = test.output.replace(/\s+/g, " ").trim();
 		const summary = ok
 			? command.proves || "Command matched expected exit code."
-			: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500);
+			: evaluated.fatalSignals.length
+				? `Command emitted fatal runtime signal(s): ${evaluated.fatalSignals.join(", ")}.`
+				: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500);
 		results.push({ command: command.command, ok, code: test.code, failureKind, summary });
 		evidenceLines.push(
 			`### ${command.command}`,
@@ -7319,8 +7393,9 @@ function runHandoffIntegrationGate(
 		notify?.(`Handoff integration gate: running ${command.command}...`, "info");
 		const test = runCommand(commandCwd, command.command, 15 * 60_000);
 		const expected = command.expected_exit ?? 0;
-		const ok = test.code === expected;
-		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, test.ok, test.code);
+		const evaluated = verificationCommandPassed(test, expected);
+		const ok = evaluated.ok;
+		const failureKind: TestFailureKind = ok ? "none" : classifyTestFailure(test.output, false, test.code);
 		const compactOutput = test.output.replace(/\s+/g, " ").trim();
 		results.push({
 			command: command.command,
@@ -7329,7 +7404,9 @@ function runHandoffIntegrationGate(
 			failureKind,
 			summary: ok
 				? command.proves || "Integration gate passed."
-				: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500),
+				: evaluated.fatalSignals.length
+					? `Command emitted fatal runtime signal(s): ${evaluated.fatalSignals.join(", ")}.`
+					: truncateMiddle(compactOutput || `Command exited ${test.code}, expected ${expected}.`, 500),
 		});
 		evidenceLines.push(
 			`### ${command.command}`,
@@ -7546,7 +7623,9 @@ async function runHandoffOrchestration(options: {
 			{ id: `handoff-review-${lane.id}`, label: `Review ${lane.id}: ${lane.name}`, status: "pending" as HybridStageStatus },
 		]),
 		{ id: "handoff-integration", label: "Integration seam gate", status: "pending" },
+		{ id: "handoff-verification", label: "Final deterministic verification", status: "pending" },
 		{ id: "summary", label: "Local final summary", status: "pending" },
+		{ id: "handoff-frontier-final", label: "Frontier final gate", status: "pending" },
 	];
 	const reporter = createHybridReporter(details, options.onUpdate, options.ctx);
 	const notify: Notify = (message, type = "info") => {
@@ -7604,12 +7683,37 @@ async function runHandoffOrchestration(options: {
 		} else {
 			reporter.stage("handoff-integration", "skipped", "single-lane handoff; no cross-lane seam");
 		}
+		reporter.stage("handoff-verification", "running", "Running final inferred test, lint, typecheck, and build commands");
+		const completionVerification = runVerificationSummary(options.cwd, config, state, notify);
+		if (!completionVerification.allPassed) {
+			reporter.stage("handoff-verification", "failed", "one or more final verification commands failed");
+			throw new Error(`Handoff final verification failed. See ${config.stateDir}/verification-summary.md`);
+		}
+		reporter.stage("handoff-verification", "done", `${completionVerification.commands.length} command(s) passed`);
 		reporter.stage("summary", "running", "Generating local final summary");
 		await runHandoffFinalSummary(options.cwd, config, state, manifest, notify, liveLog);
-		reporter.stage("summary", "done", "handoff complete");
+		reporter.stage("summary", "done", "local summary written");
+		details.localVerdict = seamUnverified ? "PASS_WITH_CONCERNS" : "PASS";
+		reporter.stage("handoff-frontier-final", "running", "Reviewing final artifacts and canonical task status");
+		const final = await runFrontierFinal(options.cwd, config, state, notify, liveLog);
+		details.frontierVerdict = final.verdict;
+		if (final.verdict !== "APPROVE") {
+			reporter.stage("handoff-frontier-final", "failed", `verdict=${final.verdict}`);
+			const progress = readProgress(options.cwd, config, manifest.objective);
+			const finalPayload = extractJsonObject<{ blockingIssues?: string[]; requiredFixes?: string[]; highRiskResidualBlockers?: string[] }>(final.result.text);
+			progress.blockers = uniqueStrings([
+				...progress.blockers,
+				...(finalPayload?.blockingIssues ?? []),
+				...(finalPayload?.requiredFixes ?? []),
+				...(finalPayload?.highRiskResidualBlockers ?? []),
+			]);
+			progress.nextAction = `Resolve frontier final verdict ${final.verdict}, then resume the handoff run.`;
+			writeProgress(options.cwd, config, state, progress);
+			throw new Error(`Frontier final gate rejected handoff completion: ${final.verdict}. See ${config.stateDir}/final-review.md`);
+		}
+		reporter.stage("handoff-frontier-final", "done", "verdict=APPROVE");
 		details.status = "done";
 		details.finishedAt = nowIso();
-		details.localVerdict = seamUnverified ? "PASS_WITH_CONCERNS" : "PASS";
 		details.artifacts = { ...state.artifacts };
 		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
 		writeArtifact(options.cwd, config, state, "usage-summary.md", details.usageSummary);
@@ -7620,6 +7724,11 @@ async function runHandoffOrchestration(options: {
 		details.status = "failed";
 		details.finishedAt = nowIso();
 		details.error = error instanceof Error ? error.message : String(error);
+		details.artifacts = { ...state.artifacts };
+		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
+		writeArtifact(options.cwd, config, state, "usage-summary.md", details.usageSummary);
+		saveState(options.cwd, config, state);
+		reporter.setProgress(readProgress(options.cwd, config, manifest.objective));
 		return details;
 	}
 }
@@ -8470,7 +8579,7 @@ async function runHybridOrchestration(options: {
 					state,
 					runState,
 					"frontier-final",
-					"done",
+					finalVerdict === "APPROVE" ? "done" : "failed",
 					frontierPass,
 				);
 			}
@@ -8490,6 +8599,7 @@ async function runHybridOrchestration(options: {
 			}
 		}
 
+		const frontierApproved = finalVerdict === "APPROVE";
 		summary.push(
 			"## Result",
 			"",
@@ -8500,7 +8610,8 @@ async function runHybridOrchestration(options: {
 		);
 		details.localVerdict = localVerdict;
 		details.frontierVerdict = finalVerdict;
-		details.status = "done";
+		details.status = frontierApproved ? "done" : "failed";
+		if (!frontierApproved) details.error = `Frontier final gate did not approve completion: ${finalVerdict}`;
 		details.finishedAt = nowIso();
 		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
 		reporter.stage(
@@ -8532,16 +8643,16 @@ async function runHybridOrchestration(options: {
 		);
 		details.artifacts = { ...state.artifacts };
 		saveState(options.cwd, config, state);
-		reporter.stage("summary", "done", "Artifacts written");
+		reporter.stage("summary", frontierApproved ? "done" : "failed", frontierApproved ? "Artifacts written" : details.error);
 		markHybridRunStage(
 			options.cwd,
 			config,
 			state,
 			runState,
 			"summary",
-			"done",
+			frontierApproved ? "done" : "failed",
 		);
-		reporter.emit(`Hybrid run complete: ${finalVerdict}`);
+		reporter.emit(`Hybrid run ${frontierApproved ? "complete" : "rejected"}: ${finalVerdict}`);
 		setStatusWidget(options.ctx, statusMarkdown(options.cwd, config, state));
 		const notifyType =
 			finalVerdict === "APPROVE"
@@ -8550,7 +8661,7 @@ async function runHybridOrchestration(options: {
 					? "error"
 					: "warning";
 		options.ctx?.ui?.notify?.(
-			`Hybrid run complete: ${finalVerdict}`,
+			`Hybrid run ${frontierApproved ? "complete" : "rejected"}: ${finalVerdict}`,
 			notifyType,
 		);
 		return details;
