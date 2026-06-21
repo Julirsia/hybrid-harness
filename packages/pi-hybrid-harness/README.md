@@ -64,6 +64,7 @@ Then reload Pi:
 /hybrid-handoff-status # show imported handoff lane progress
 hybrid_exec tool       # parent Pi orchestrator executes one spec-kit/task batch package through the persistent writer loop
 /hybrid-monitor        # toggle live child-session output modal (F8 fallback shortcut)
+/hybrid-writer-session # show persistent writer session id/path and bounded transcript metadata
 /hybrid-steer <note>    # queue parent steering for the next child session/stage boundary
 /hybrid-steering        # show queued/consumed parent steering notes
 /hybrid-steer-clear     # clear queued/consumed parent steering notes
@@ -157,7 +158,7 @@ The package writes durable state to `.pi-harness/`:
   checkpoints/
 ```
 
-Resume is artifact-backed at the orchestration level, while local implementation/repair/debug work uses one persistent writer session by default. If a run is interrupted, rerun `/hybrid-run` without a task or call `hybrid_run` with `resume: true`; completed stages with matching artifacts are skipped, read-only scout/review/frontier gates remain fresh, and the next local worker turn continues the saved writer session from `.pi-harness/sessions/`.
+Resume is artifact-backed at the orchestration level, while local implementation/repair/debug work uses one persistent writer session by default. If a run is interrupted, rerun `/hybrid-run` without a task or call `hybrid_run` with `resume: true`; completed stages with matching artifacts are skipped, read-only scout/review/frontier gates remain fresh, and the next local worker turn continues the saved writer session from `.pi-harness/sessions/`. `/hybrid-monitor` shows the active worker stream from memory; `/hybrid-writer-session` shows session id/path and file sizes without duplicating or expanding the transcript.
 
 For spec-kit-style workflows, the parent Pi conversation can act as the persistent orchestrator: after `tasks.md` is ready, it chooses the next batch, calls the `hybrid_exec` tool with a bounded `executionPackage`, receives `progress.json`, `local-log.md`, `test-evidence.md`, `git-summary.md`, `verification-summary.json`, and `local-review.md`, then decides whether to send the next batch, a repair package, a debug package, or stop/escalate. The harness executes packages; the parent orchestrator owns sequencing judgment.
 

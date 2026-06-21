@@ -309,6 +309,8 @@ interface HybridRunDetails {
 	frontierVerdict?: ReturnType<typeof parseFrontierVerdict>;
 	frontierInputCostPerMTok?: number;
 	frontierOutputCostPerMTok?: number;
+	writerSessionId?: string;
+	writerSessionDir?: string;
 	artifacts: Record<string, string>;
 	usageSummary?: string;
 	error?: string;
@@ -2779,6 +2781,79 @@ function usageSummaryMarkdown(cwd: string, config: HarnessConfig): string {
 	return lines.join("\n");
 }
 
+function formatBytes(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes < 0) return "unknown";
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function findWriterSessionFiles(
+	sessionDir: string,
+	sessionId: string | undefined,
+	limit = 12,
+): Array<{ file: string; size: number }> {
+	if (!sessionId || !fs.existsSync(sessionDir)) return [];
+	const matches: Array<{ file: string; size: number; mtimeMs: number }> = [];
+	const queue = [sessionDir];
+	let visited = 0;
+	while (queue.length && visited < 300) {
+		const dir = queue.shift()!;
+		let entries: fs.Dirent[] = [];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			visited++;
+			const filePath = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (queue.length < 40) queue.push(filePath);
+				continue;
+			}
+			if (!entry.name.includes(sessionId)) continue;
+			try {
+				const stat = fs.statSync(filePath);
+				matches.push({ file: filePath, size: stat.size, mtimeMs: stat.mtimeMs });
+			} catch {
+				// ignore disappearing files
+			}
+			if (matches.length >= limit * 2) break;
+		}
+	}
+	return matches
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, limit)
+		.map(({ file, size }) => ({ file, size }));
+}
+
+function hybridWriterSessionInfo(cwd: string, config: HarnessConfig): {
+	id?: string;
+	dir: string;
+	absDir: string;
+	files: Array<{ file: string; size: number }>;
+} {
+	const runState = readJsonFile<Partial<HybridRunState>>(
+		artifactPath(cwd, config, "run-state.json"),
+	);
+	const writerSessionDir =
+		typeof runState?.writerSessionDir === "string" && runState.writerSessionDir.trim()
+			? runState.writerSessionDir
+			: config.writerSessionDir;
+	const absDir = hybridWriterSessionDir(cwd, config, writerSessionDir);
+	const id =
+		typeof runState?.writerSessionId === "string" && runState.writerSessionId.trim()
+			? runState.writerSessionId
+			: undefined;
+	return {
+		id,
+		dir: path.relative(cwd, absDir) || absDir,
+		absDir,
+		files: findWriterSessionFiles(absDir, id),
+	};
+}
+
 function statusMarkdown(
 	cwd: string,
 	config: HarnessConfig,
@@ -2793,6 +2868,19 @@ function statusMarkdown(
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([name, rel]) => `- ${name}: \`${rel}\``)
 		.join("\n");
+	const writerSession = hybridWriterSessionInfo(cwd, config);
+	const writerSessionLines = writerSession.id
+		? [
+				`- id: \`${writerSession.id}\``,
+				`- dir: \`${writerSession.dir}\``,
+				`- files: ${writerSession.files.length ? writerSession.files.map((entry) => `\`${path.relative(cwd, entry.file) || entry.file}\` (${formatBytes(entry.size)})`).join(", ") : "not found yet"}`,
+				"- note: monitor shows live output in memory; this command does not copy or expand the saved transcript.",
+			].join("\n")
+		: [
+				`- id: not created yet`,
+				`- dir: \`${writerSession.dir}\``,
+				"- note: a writer session is created when the first local implementation/repair package runs.",
+			].join("\n");
 	const activeRunLines = activeLock
 		? [
 				`- liveId: \`${activeLock.liveId}\``,
@@ -2816,6 +2904,7 @@ function statusMarkdown(
 		`- 상태 디렉터리: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
 		`- 실행 중인 백그라운드 작업: ${activeLock ? `${activeLock.currentStage ?? "unknown"} (${activeLock.liveId})` : "없음"}`,
 		`- 대기 중인 steering 메모: ${queuedSteering}개`,
+		`- writer 세션: ${writerSession.id ?? "아직 생성되지 않음"}`,
 		`- 사람이 확인할 주요 문서: ${config.stateDir}/requirements.md, ${config.stateDir}/progress.md, ${config.stateDir}/run-summary.md`,
 		"",
 		...hybridStageReferenceMarkdown().split("\n"),
@@ -2841,6 +2930,9 @@ function statusMarkdown(
 		"",
 		"## Active Run",
 		activeRunLines,
+		"",
+		"## Persistent Writer Session",
+		writerSessionLines,
 		"",
 		"## Artifacts",
 		artifactLines || "(none)",
@@ -3887,6 +3979,13 @@ function koreanHybridRunOverviewLines(
 		`${fg("accent", "현재 상황")} ${statusBadge(theme, hybridStatusKo(details.status), statusColor)} ${statusBadge(theme, details.mode, "dim")}`,
 	);
 	lines.push(`${fg("dim", "작업")} ${truncateMiddle(details.task, 140)}`);
+	if (details.writerSessionId) {
+		const sessionParts = [
+			truncateMiddle(details.writerSessionId, 80),
+			details.writerSessionDir ? truncateMiddle(details.writerSessionDir, 80) : undefined,
+		].filter(Boolean);
+		lines.push(`${fg("dim", "writer 세션")} ${sessionParts.join(" · ")}`);
+	}
 	lines.push(
 		`${fg("dim", "현재 실행")} ${currentFacts.length ? currentFacts.join(" · ") : "대기 중"}`,
 	);
@@ -4466,6 +4565,11 @@ function hybridDetailsToMarkdown(
 		details.status === "done" ? "✓" : details.status === "failed" ? "✗" : "⏳";
 	lines.push(`${statusIcon} Hybrid run (${details.mode})`);
 	lines.push(`Task: ${truncateMiddle(details.task, 140)}`);
+	if (details.writerSessionId) {
+		lines.push(
+			`Writer session: ${details.writerSessionId}${details.writerSessionDir ? ` (${details.writerSessionDir})` : ""}`,
+		);
+	}
 	if (details.progress) {
 		lines.push(
 			`Progress: slices ${details.progress.slicesDone}/${details.progress.slicesTotal} · AC ${details.progress.acceptanceSatisfied}/${details.progress.acceptanceTotal} · active frontier triggers ${details.progress.activeFrontierTriggers}`,
@@ -7699,6 +7803,8 @@ async function runHandoffOrchestration(options: {
 	runState.lastError = undefined;
 	saveHybridRunState(options.cwd, config, state, runState);
 	const details = createHybridRunDetails(manifest.objective, "handoff", config);
+	details.writerSessionId = runState.writerSessionId;
+	details.writerSessionDir = path.relative(options.cwd, hybridWriterSessionDir(options.cwd, config, runState.writerSessionDir)) || runState.writerSessionDir;
 	details.stages = [
 		{ id: "checkpoint", label: "Pre-run checkpoint", status: "pending" },
 		{ id: "handoff-import", label: "Import external handoff", status: options.resume ? "skipped" : "pending" },
@@ -7877,6 +7983,8 @@ async function runHybridExecutionPackage(options: {
 		writeProgress(options.cwd, config, state, fallbackProgress(task));
 	}
 	const details = createHybridRunDetails(task, "default", config);
+	details.writerSessionId = runState.writerSessionId;
+	details.writerSessionDir = path.relative(options.cwd, hybridWriterSessionDir(options.cwd, config, runState.writerSessionDir)) || runState.writerSessionDir;
 	const reporter = createHybridReporter(details, options.onUpdate, options.ctx);
 	const notify: Notify = (message, type = "info") => {
 		options.ctx?.ui?.notify?.(message, type);
@@ -8005,6 +8113,8 @@ async function runHybridOrchestration(options: {
 	runState.lastError = undefined;
 	saveHybridRunState(options.cwd, config, state, runState);
 	const details = createHybridRunDetails(task, mode, config);
+	details.writerSessionId = runState.writerSessionId;
+	details.writerSessionDir = path.relative(options.cwd, hybridWriterSessionDir(options.cwd, config, runState.writerSessionDir)) || runState.writerSessionDir;
 	const reporter = createHybridReporter(details, options.onUpdate, options.ctx);
 	const notify: Notify = (message, type = "info") => {
 		options.ctx?.ui?.notify?.(message, type);
@@ -9612,6 +9722,35 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 	pi.registerCommand("hybrid-monitor", {
 		description: "Toggle the live hybrid child-session output modal",
 		handler: async (_args, ctx) => openHybridMonitor(ctx),
+	});
+
+	pi.registerCommand("hybrid-writer-session", {
+		description: "Show the persistent writer session id, storage location, and bounded transcript file metadata",
+		handler: async (_args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			ensureStateDir(ctx.cwd, config);
+			const info = hybridWriterSessionInfo(ctx.cwd, config);
+			const lines = [
+				"# Hybrid Persistent Writer Session",
+				"",
+				`- id: ${info.id ? `\`${info.id}\`` : "not created yet"}`,
+				`- dir: \`${info.dir}\``,
+				`- persistent writer enabled: ${config.persistentWriterSession}`,
+				"",
+				"## Transcript files",
+				"",
+				...(info.files.length
+					? info.files.map((entry) => `- \`${path.relative(ctx.cwd, entry.file) || entry.file}\` (${formatBytes(entry.size)})`)
+					: ["- none found yet"]),
+				"",
+				"## Logging policy",
+				"",
+				"- `/hybrid-monitor` shows live worker output from memory and does not append raw stream output to disk.",
+				"- This command reports metadata only; it does not copy, expand, or duplicate the saved Pi session transcript.",
+				"- Durable harness artifacts are compact/truncated summaries such as local-log.md, test-evidence.md, verification-summary.json, and run-summary.md.",
+			].join("\n");
+			await showReport("Hybrid Writer Session", lines, ctx);
+		},
 	});
 
 	pi.registerShortcut(Key.ctrlAlt("h"), {

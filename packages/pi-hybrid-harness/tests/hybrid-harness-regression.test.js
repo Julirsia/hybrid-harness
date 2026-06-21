@@ -295,6 +295,21 @@ test("resume skips completed artifact-backed stages before rerunning child sessi
 	assert.match(block, /reporter\.stage\(\s*"frontier-final",\s*"skipped"/);
 });
 
+test("hybrid monitor and status expose persistent writer session without duplicating logs", () => {
+	assert.match(source, /writerSessionId\?: string/);
+	assert.match(source, /function hybridWriterSessionInfo/);
+	assert.match(source, /function findWriterSessionFiles/);
+	const overviewBlock = between("function koreanHybridRunOverviewLines", "function hybridStageFlowLine");
+	assert.match(overviewBlock, /writer 세션/);
+	assert.match(overviewBlock, /details\.writerSessionId/);
+	const statusBlock = between("function statusMarkdown", "function setStatusWidget");
+	assert.match(statusBlock, /Persistent Writer Session/);
+	assert.match(statusBlock, /does not copy or expand the saved transcript/);
+	const commandBlock = between('pi.registerCommand("hybrid-writer-session"', 'pi.registerShortcut\(Key.ctrlAlt\("h"\)');
+	assert.match(commandBlock, /metadata only/);
+	assert.match(commandBlock, /does not copy, expand, or duplicate/);
+});
+
 test("hybrid_exec exposes parent-orchestrator package execution loop", () => {
 	assert.match(source, /interface HybridExecParams/);
 	assert.match(source, /async function runHybridExecutionPackage/);
