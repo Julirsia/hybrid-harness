@@ -301,6 +301,7 @@ test("hybrid monitor and status expose persistent writer session without duplica
 	assert.match(source, /function findWriterSessionFiles/);
 	const overviewBlock = between("function koreanHybridRunOverviewLines", "function hybridStageFlowLine");
 	assert.match(overviewBlock, /writer 세션/);
+	assert.match(overviewBlock, /tasks\/조각/);
 	assert.match(overviewBlock, /details\.writerSessionId/);
 	const statusBlock = between("function statusMarkdown", "function setStatusWidget");
 	assert.match(statusBlock, /Persistent Writer Session/);
@@ -322,6 +323,8 @@ test("hybrid_exec exposes parent-orchestrator package execution loop", () => {
 	assert.match(toolBlock, /store\.set\(liveId/);
 	assert.match(toolBlock, /Use \/hybrid-monitor for live worker output/);
 	assert.match(toolBlock, /runHybridExecutionPackage/);
+	assert.match(toolBlock, /renderResult/);
+	assert.match(toolBlock, /renderHybridRunResult/);
 	assert.match(toolBlock, /persistent single-writer session/);
 	const promptBlock = between("function localWorkerPrompt", "interface HandoffValidationCommand");
 	assert.match(promptBlock, /orchestrator-package\.md/);

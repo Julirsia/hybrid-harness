@@ -4003,7 +4003,7 @@ function koreanHybridRunOverviewLines(
 			lines.push(`${fg("dim", "현재 슬라이스")} ${sliceParts.join(" · ")}${remaining}`);
 		}
 		const progressParts = [
-			`조각 ${fg("success", ratioBar(p.slicesDone, p.slicesTotal))} ${p.slicesDone}/${p.slicesTotal}`,
+			`tasks/조각 ${fg("success", ratioBar(p.slicesDone, p.slicesTotal))} 완료 ${p.slicesDone}/${p.slicesTotal}`,
 			`승인 기준 ${fg("success", ratioBar(p.acceptanceSatisfied, p.acceptanceTotal))} ${p.acceptanceSatisfied}/${p.acceptanceTotal}`,
 			`frontier 재확인 ${p.activeFrontierTriggers}`,
 		];
@@ -4572,7 +4572,7 @@ function hybridDetailsToMarkdown(
 	}
 	if (details.progress) {
 		lines.push(
-			`Progress: slices ${details.progress.slicesDone}/${details.progress.slicesTotal} · AC ${details.progress.acceptanceSatisfied}/${details.progress.acceptanceTotal} · active frontier triggers ${details.progress.activeFrontierTriggers}`,
+			`Progress: tasks/slices completed ${details.progress.slicesDone}/${details.progress.slicesTotal} · AC ${details.progress.acceptanceSatisfied}/${details.progress.acceptanceTotal} · active frontier triggers ${details.progress.activeFrontierTriggers}`,
 		);
 		if (details.progress.nextAction)
 			lines.push(`Next: ${truncateMiddle(details.progress.nextAction, 160)}`);
@@ -7997,6 +7997,7 @@ async function runHybridExecutionPackage(options: {
 	};
 	(liveLog as any).onEvent = (label: string, event: any) => reporter.childEvent(label, event);
 	(liveLog as any).signal = options.signal ?? options.ctx?.signal;
+	reporter.setProgress(readProgress(options.cwd, config, task));
 	try {
 		reporter.stage("local-loop", "running", `parent package ${packageId}`);
 		const testPassed = await runLocalLoop(
@@ -9738,6 +9739,27 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				details,
 				isError: details.status === "failed",
 			};
+		},
+		renderCall(args: unknown, theme: any) {
+			const params = args as Partial<HybridExecParams>;
+			const w = getTermWidth() - 4;
+			const packageId = params.packageId ? ` ${theme.fg("dim", `[${params.packageId}]`)}` : "";
+			const taskPreview = truncateMiddle(
+				params.task ?? params.executionPackage ?? "",
+				Math.max(20, w - 36),
+			);
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("hybrid_exec"))}${packageId} ${theme.fg("accent", taskPreview)}`,
+				0,
+				0,
+			);
+		},
+		renderResult(
+			result: AgentToolResult<HybridRunDetails>,
+			options: { expanded?: boolean; isPartial?: boolean },
+			theme: any,
+		) {
+			return renderHybridRunResult(result, options, theme);
 		},
 	});
 
