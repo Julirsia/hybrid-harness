@@ -317,6 +317,10 @@ test("hybrid_exec exposes parent-orchestrator package execution loop", () => {
 	assert.match(source, /Parent Orchestrator Execution Package/);
 	const toolBlock = between('name: "hybrid_exec"', 'pi.registerCommand("hybrid-monitor"');
 	assert.match(toolBlock, /executionPackage/);
+	assert.match(toolBlock, /const liveId = makeHybridLiveId\(\)/);
+	assert.match(toolBlock, /setLastHybridLiveId\(liveId\)/);
+	assert.match(toolBlock, /store\.set\(liveId/);
+	assert.match(toolBlock, /Use \/hybrid-monitor for live worker output/);
 	assert.match(toolBlock, /runHybridExecutionPackage/);
 	assert.match(toolBlock, /persistent single-writer session/);
 	const promptBlock = between("function localWorkerPrompt", "interface HandoffValidationCommand");

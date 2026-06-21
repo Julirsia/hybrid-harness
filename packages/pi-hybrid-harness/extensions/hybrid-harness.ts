@@ -9695,6 +9695,20 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				| undefined,
 			ctx: any,
 		) {
+			const liveId = makeHybridLiveId();
+			setLastHybridLiveId(liveId);
+			const store = getHybridLiveStore();
+			let version = 0;
+			const preview = createHybridRunDetails(
+				params.task ?? "parent orchestrator package",
+				"default",
+				loadConfig(ctx.cwd),
+			);
+			preview.currentStage = "local-loop";
+			preview.recentOutput.push(
+				`hybrid_exec package ${params.packageId ?? "package"} starting. Use /hybrid-monitor for live worker output.`,
+			);
+			store.set(liveId, { version: ++version, details: preview });
 			const details = await runHybridExecutionPackage({
 				cwd: ctx.cwd,
 				ctx,
@@ -9704,8 +9718,16 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				loops: params.loops,
 				debug: params.debug,
 				signal,
-				onUpdate,
+				onUpdate: (result) => {
+					if (result.details) {
+						store.set(liveId, { version: ++version, details: result.details });
+					}
+					onUpdate?.(result);
+					ctx.ui?.requestRender?.();
+				},
 			});
+			store.set(liveId, { version: ++version, details });
+			ctx.ui?.requestRender?.();
 			return {
 				content: [
 					{
