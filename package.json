@@ -1,29 +1,23 @@
 {
-  "name": "harnessproject",
-  "version": "0.1.0",
+  "name": "hybrid-harness",
+  "version": "0.3.0",
   "private": true,
-  "description": "Monorepo for Pi, Codex, and OpenCode harness tooling.",
+  "description": "Pi-only hybrid harness package for persistent-writer local implementation loops with frontier gates.",
   "workspaces": [
-    "packages/pi-hybrid-harness",
-    "packages/qwen-harness-codex",
-    "packages/qwen-harness-opencode"
+    "packages/pi-hybrid-harness"
   ],
   "pi": {
     "extensions": [
       "./packages/pi-hybrid-harness/extensions"
+    ],
+    "skills": [
+      "./packages/pi-hybrid-harness/skills"
     ]
   },
   "scripts": {
-    "test": "npm run test --workspaces --if-present",
-    "test:codex": "npm test -w qwen-harness-codex",
-    "test:qwen": "npm test -w qwen-harness-opencode",
+    "test": "npm test -w pi-hybrid-harness",
     "pack:pi": "npm run pack:dry -w pi-hybrid-harness",
-    "install:plugins": "./scripts/update-plugins.sh",
-    "update:plugins": "./scripts/update-plugins.sh",
-    "update:pi": "./scripts/update-plugins.sh pi",
-    "update:opencode": "./scripts/update-plugins.sh opencode",
-    "update:codex": "./scripts/update-plugins.sh codex",
-    "install:opencode": "npm run install:global -w qwen-harness-opencode",
-    "uninstall:opencode": "npm run uninstall:global -w qwen-harness-opencode"
+    "install:pi": "./scripts/update-plugins.sh pi",
+    "update:pi": "./scripts/update-plugins.sh pi"
   }
 }

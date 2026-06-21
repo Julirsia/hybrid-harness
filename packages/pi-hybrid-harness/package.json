@@ -1,6 +1,6 @@
 {
   "name": "pi-hybrid-harness",
-  "version": "0.2.12",
+  "version": "0.3.0",
   "description": "Pi package for frontier-designed, local-LLM implementation loops with frontier final gates.",
   "keywords": [
     "pi-package",
@@ -14,6 +14,9 @@
   "pi": {
     "extensions": [
       "./extensions"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "peerDependencies": {
@@ -30,6 +33,7 @@
   },
   "files": [
     "extensions",
+    "skills",
     "bin",
     "README.md",
     "package.json"

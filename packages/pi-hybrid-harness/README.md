@@ -13,7 +13,7 @@ The goal is to spend frontier-model tokens on high-leverage design and quality g
 - State directory: `.pi-harness/`
 - Local endpoint: `http://192.168.0.44:8080/v1`
 - Local worker: `local-qwen/qwen36-27b-mtp-iq4xs`
-- Local reviewer: `local-qwen/qwen36-35b-a3b-iq4xs`
+- Local reviewer: `local-qwen/qwen36-27b-mtp-iq4xs`
 - Frontier: `openai-codex/gpt-5.5` with `high` thinking
 
 The extension dynamically registers a `local-qwen` provider from the llama.cpp `/v1/models` endpoint. It also registers a `hybrid_run` custom tool with compact/expanded Pi TUI rendering for live harness progress.
@@ -62,6 +62,7 @@ Then reload Pi:
 /hybrid-handoff-run <dir> # import external handoff docs and run local-only lane implementation/review/repair loops
 /hybrid-handoff-resume # resume an imported external handoff from unfinished lanes
 /hybrid-handoff-status # show imported handoff lane progress
+hybrid_exec tool       # parent Pi orchestrator executes one spec-kit/task batch package through the persistent writer loop
 /hybrid-monitor        # toggle live child-session output modal (F8 fallback shortcut)
 /hybrid-steer <note>    # queue parent steering for the next child session/stage boundary
 /hybrid-steering        # show queued/consumed parent steering notes
@@ -112,7 +113,7 @@ If another agent/tool already prepared handoff documents, skip frontier scout/de
 /hybrid-monitor
 ```
 
-The handoff directory should contain `manual-handoff-spec.json` when available and lane prompts at `lanes/**/05-worker-prompt.md`. The harness imports the handoff into `.pi-harness/requirements.md`, `.pi-harness/frontier-design.md`, `.pi-harness/implementation-plan.json`, `.pi-harness/progress.json`, then processes lanes in numeric order. Each lane runs in fresh Pi child sessions using the configured `localWorkerModel`; validation commands from the handoff are executed; `localReviewerModel` reviews the lane; failed validation/review triggers bounded local repair attempts. After all lanes, the harness reruns inferred verification commands and calls the configured frontier model for the final gate. Only `APPROVE` marks the handoff complete. Resume with `/hybrid-handoff-resume` and inspect with `/hybrid-handoff-status`.
+The handoff directory should contain `manual-handoff-spec.json` when available and lane prompts at `lanes/**/05-worker-prompt.md`. The harness imports the handoff into `.pi-harness/requirements.md`, `.pi-harness/frontier-design.md`, `.pi-harness/implementation-plan.json`, `.pi-harness/progress.json`, then processes lanes in numeric order. Each lane runs through the persistent single-writer Pi session using the configured `localWorkerModel`; validation commands from the handoff are executed; `localReviewerModel` reviews the lane in a separate read-only pass; failed validation/review triggers bounded local repair attempts. After all lanes, the harness reruns inferred verification commands and calls the configured frontier model for the final gate. Only `APPROVE` marks the handoff complete. Resume with `/hybrid-handoff-resume` and inspect with `/hybrid-handoff-status`.
 
 Implementation and repair remain local after import; the frontier model is reserved for the final shipping decision.
 
@@ -141,6 +142,7 @@ The package writes durable state to `.pi-harness/`:
   handoff-review-<lane>.md
   local-log.md
   orchestration-brief.md
+  orchestrator-package.md
   user-clarifications.md
   steering.jsonl
   git-summary.md
@@ -151,10 +153,13 @@ The package writes durable state to `.pi-harness/`:
   live-log.md
   events.jsonl
   doctor.md
+  sessions/
   checkpoints/
 ```
 
-Resume is artifact-backed, not a live child-process continuation. If a run is interrupted, rerun `/hybrid-run` without a task or call `hybrid_run` with `resume: true`; completed stages with matching artifacts are skipped and the next incomplete child session is started fresh.
+Resume is artifact-backed at the orchestration level, while local implementation/repair/debug work uses one persistent writer session by default. If a run is interrupted, rerun `/hybrid-run` without a task or call `hybrid_run` with `resume: true`; completed stages with matching artifacts are skipped, read-only scout/review/frontier gates remain fresh, and the next local worker turn continues the saved writer session from `.pi-harness/sessions/`.
+
+For spec-kit-style workflows, the parent Pi conversation can act as the persistent orchestrator: after `tasks.md` is ready, it chooses the next batch, calls the `hybrid_exec` tool with a bounded `executionPackage`, receives `progress.json`, `local-log.md`, `test-evidence.md`, `git-summary.md`, `verification-summary.json`, and `local-review.md`, then decides whether to send the next batch, a repair package, a debug package, or stop/escalate. The harness executes packages; the parent orchestrator owns sequencing judgment.
 
 Full `/hybrid-run*` commands now start in the background so the parent Pi conversation can continue. Use `/hybrid-monitor` for live output, `/hybrid-steer <note>` to add parent steering that will be read by later child sessions, and `/hybrid-cancel` to abort the active run and terminate the current child process. Steering is stage-boundary based; it is not injected into the stdin of an already-running child.
 
@@ -169,6 +174,8 @@ Create `.pi-harness/config.json`:
 ```json
 {
   "testCommand": "npm test",
+  "persistentWriterSession": true,
+  "writerSessionDir": "sessions",
   "maxLocalLoops": 4,
   "maxReviewRepairCycles": 2,
   "maxFrontierPasses": 2,
@@ -184,7 +191,7 @@ Create `.pi-harness/config.json`:
   "frontierModel": "openai-codex/gpt-5.5",
   "frontierThinking": "high",
   "localWorkerModel": "local-qwen/qwen36-27b-mtp-iq4xs",
-  "localReviewerModel": "local-qwen/qwen36-35b-a3b-iq4xs"
+  "localReviewerModel": "local-qwen/qwen36-27b-mtp-iq4xs"
 }
 ```
 
@@ -248,4 +255,4 @@ pi remove -l npm:pi-subagentura@1.0.12 # optional legacy cleanup
 - `pi-show-diffs`: safety gate before edit/write changes.
 - `pi-subagents`: mature reference/companion for delegated subagent UX, chain/parallel execution, and background jobs.
 
-Large workflow packages such as `oh-my-opencode-pi` and `@linimin/pi-letscook` are worth studying, but this package keeps the core orchestration small so frontier-token routing stays explicit.
+This package keeps the core orchestration small so frontier-token routing stays explicit.

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
@@ -22,10 +22,21 @@ function assertOrder(block, firstNeedle, secondNeedle) {
 	assert.ok(first < second, `expected ${firstNeedle} before ${secondNeedle}`);
 }
 
-test("default local reviewer uses the 35B model while the worker remains 27B", () => {
+test("package exposes spec-kit hybrid orchestrator skill", () => {
+	const pkg = JSON.parse(readFileSync(path.resolve("package.json"), "utf8"));
+	assert.deepEqual(pkg.pi.skills, ["./skills"]);
+	assert.equal(existsSync(path.resolve("skills/spec-kit-hybrid-orchestrator/SKILL.md")), true);
+	const skill = readFileSync(path.resolve("skills/spec-kit-hybrid-orchestrator/SKILL.md"), "utf8");
+	assert.match(skill, /hybrid_exec/);
+	assert.match(skill, /persistent orchestrator/);
+	assert.match(skill, /spec\.md/);
+	assert.match(skill, /tasks\.md/);
+});
+
+test("default local reviewer matches the worker model", () => {
 	const block = between("const DEFAULT_CONFIG", "function statePath");
 	assert.match(block, /localWorkerModel: "local-qwen\/qwen36-27b-mtp-iq4xs"/);
-	assert.match(block, /localReviewerModel: "local-qwen\/qwen36-35b-a3b-iq4xs"/);
+	assert.match(block, /localReviewerModel: "local-qwen\/qwen36-27b-mtp-iq4xs"/);
 });
 
 test("report overlays use the custom UI whenever interactive UI is available", () => {
@@ -256,6 +267,23 @@ test("hybrid orchestration persists cycle-aware run state for artifact-based res
 	assert.match(orchestrationBlock, /markHybridRunFailure/);
 });
 
+test("hybrid local implementation uses one persistent writer session across repair/debug loops", () => {
+	assert.match(source, /persistentWriterSession: boolean/);
+	assert.match(source, /writerSessionId: string/);
+	assert.match(source, /function newHybridWriterSessionId/);
+	assert.match(source, /function hybridWriterSessionDir/);
+	const runPiBlock = between("async function runPiOnce", "async function fetchLocalModels");
+	assert.match(runPiBlock, /sessionPolicy\?: "ephemeral" \| "persistent"/);
+	assert.match(runPiBlock, /--session-id/);
+	assert.match(runPiBlock, /--no-session/);
+	const localLoopBlock = between("async function runLocalLoop", "async function runLocalReview");
+	assert.match(localLoopBlock, /runState: HybridRunState/);
+	assert.match(localLoopBlock, /sessionPolicy: config\.persistentWriterSession \? "persistent" : "ephemeral"/);
+	assert.match(localLoopBlock, /sessionId: runState\.writerSessionId/);
+	const promptBlock = between("function localWorkerPrompt", "interface HandoffValidationCommand");
+	assert.match(promptBlock, /PERSISTENT SINGLE WRITER/);
+});
+
 test("resume skips completed artifact-backed stages before rerunning child sessions", () => {
 	const block = between("async function runHybridOrchestration", "export default async function hybridHarness");
 	assert.match(block, /shouldSkipHybridStage\([^)]*"design"/);
@@ -265,6 +293,20 @@ test("resume skips completed artifact-backed stages before rerunning child sessi
 	assert.match(block, /parseLocalVerdict\(reviewText\)/);
 	assert.match(block, /parseFrontierVerdict\(readArtifact\(options\.cwd,\s*config,\s*"final-review\.md"\)\)/);
 	assert.match(block, /reporter\.stage\(\s*"frontier-final",\s*"skipped"/);
+});
+
+test("hybrid_exec exposes parent-orchestrator package execution loop", () => {
+	assert.match(source, /interface HybridExecParams/);
+	assert.match(source, /async function runHybridExecutionPackage/);
+	assert.match(source, /"orchestrator-package\.md"/);
+	assert.match(source, /Parent Orchestrator Execution Package/);
+	const toolBlock = between('name: "hybrid_exec"', 'pi.registerCommand("hybrid-monitor"');
+	assert.match(toolBlock, /executionPackage/);
+	assert.match(toolBlock, /runHybridExecutionPackage/);
+	assert.match(toolBlock, /persistent single-writer session/);
+	const promptBlock = between("function localWorkerPrompt", "interface HandoffValidationCommand");
+	assert.match(promptBlock, /orchestrator-package\.md/);
+	assert.match(promptBlock, /Current Parent-Orchestrator Execution Package/);
 });
 
 test("hybrid_run tool can resume without requiring a task payload", () => {

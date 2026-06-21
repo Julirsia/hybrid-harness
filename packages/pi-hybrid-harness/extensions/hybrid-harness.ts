@@ -51,6 +51,8 @@ interface HarnessConfig {
 	liveLogMaxWidgetLines: number;
 	briefBeforeImplementation: boolean;
 	askUserOnAmbiguity: boolean;
+	persistentWriterSession: boolean;
+	writerSessionDir: string;
 	testCommand?: string;
 	verificationCommands: string[];
 	allowManifestReviewWhenNoGit: boolean;
@@ -216,6 +218,8 @@ interface HybridRunState {
 	frontierPass: number;
 	repairCycle: number;
 	completedStages: Record<string, string>;
+	writerSessionId: string;
+	writerSessionDir: string;
 	lastError?: string;
 }
 
@@ -318,6 +322,14 @@ interface HybridRunParams {
 	background?: boolean;
 }
 
+interface HybridExecParams {
+	task?: string;
+	packageId?: string;
+	executionPackage: string;
+	loops?: number;
+	debug?: boolean;
+}
+
 interface OrchestrationBrief {
 	planSummary: string;
 	executionStrategy: string[];
@@ -387,6 +399,8 @@ const DEFAULT_CONFIG: HarnessConfig = {
 	liveLogMaxWidgetLines: 30,
 	briefBeforeImplementation: true,
 	askUserOnAmbiguity: true,
+	persistentWriterSession: true,
+	writerSessionDir: "sessions",
 	verificationCommands: [],
 	allowManifestReviewWhenNoGit: true,
 	requireDeterministicTestsForInteractive: true,
@@ -395,6 +409,28 @@ const DEFAULT_CONFIG: HarnessConfig = {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+function safeSessionIdPart(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 80) || "task";
+}
+
+function newHybridWriterSessionId(task: string): string {
+	return `hybrid-writer-${safeSessionIdPart(task)}-${Date.now().toString(36)}`;
+}
+
+function hybridWriterSessionDir(
+	cwd: string,
+	config: HarnessConfig,
+	writerSessionDir = config.writerSessionDir,
+): string {
+	return path.isAbsolute(writerSessionDir)
+		? writerSessionDir
+		: artifactPath(cwd, config, writerSessionDir);
 }
 
 function readJsonFile<T>(filePath: string): T | undefined {
@@ -444,6 +480,7 @@ function loadConfig(
 	if (!merged.localReviewerModel.includes("/")) {
 		merged.localReviewerModel = `${merged.localProvider}/${merged.localReviewerModel}`;
 	}
+	if (!merged.writerSessionDir) merged.writerSessionDir = "sessions";
 	return merged;
 }
 
@@ -757,6 +794,8 @@ function loadHybridRunState(
 		artifactPath(cwd, config, "run-state.json"),
 	);
 	const timestamp = nowIso();
+	const defaultWriterSessionId = newHybridWriterSessionId(task);
+	const defaultWriterSessionDir = config.writerSessionDir || "sessions";
 	if (existing?.version === 1 && existing.task === task) {
 		const completedStages =
 			existing.completedStages && typeof existing.completedStages === "object"
@@ -783,6 +822,14 @@ function loadHybridRunState(
 				? Number(existing.repairCycle)
 				: 1,
 			completedStages,
+			writerSessionId:
+				typeof existing.writerSessionId === "string" && existing.writerSessionId.trim()
+					? existing.writerSessionId
+					: defaultWriterSessionId,
+			writerSessionDir:
+				typeof existing.writerSessionDir === "string" && existing.writerSessionDir.trim()
+					? existing.writerSessionDir
+					: defaultWriterSessionDir,
 			lastError:
 				typeof existing.lastError === "string" ? existing.lastError : undefined,
 		};
@@ -797,6 +844,8 @@ function loadHybridRunState(
 		frontierPass: 1,
 		repairCycle: 1,
 		completedStages: {},
+		writerSessionId: defaultWriterSessionId,
+		writerSessionDir: defaultWriterSessionDir,
 	};
 }
 
@@ -2289,16 +2338,22 @@ async function runPiOnce(options: {
 	rawEventPath?: string;
 	onLog?: (line: string) => void;
 	signal?: AbortSignal;
+	sessionPolicy?: "ephemeral" | "persistent";
+	sessionId?: string;
+	sessionDir?: string;
 }): Promise<PiRunResult> {
 	const tmp = await writeTempPrompt(options.prompt);
-	const args = [
-		"--mode",
-		"json",
-		"-p",
-		"--no-session",
-		"--model",
-		options.model,
-	];
+	const args = ["--mode", "json", "-p"];
+	if (options.sessionPolicy === "persistent" && options.sessionId) {
+		if (options.sessionDir) {
+			fs.mkdirSync(options.sessionDir, { recursive: true });
+			args.push("--session-dir", options.sessionDir);
+		}
+		args.push("--session-id", options.sessionId);
+	} else {
+		args.push("--no-session");
+	}
+	args.push("--model", options.model);
 	if (options.thinking) args.push("--thinking", options.thinking);
 	if (options.noTools) args.push("--no-tools");
 	else if (options.tools?.length) args.push("--tools", options.tools.join(","));
@@ -2817,12 +2872,15 @@ function localWorkerPrompt(
 	if (steering && cwd) markHybridSteeringConsumed(cwd, config, "local-worker");
 	const requirementsContext = cwd ? hybridRequirementsContext(cwd, config) : [];
 	return [
-		"You are the LOCAL IMPLEMENTER in a hybrid Pi coding harness.",
+		"You are the PERSISTENT SINGLE WRITER in a hybrid Pi coding harness.",
+		"Continue from your prior writer-session context when present; keep one coherent implementation thread across implementation, repair, and debug loops.",
 		"The frontier model already prepared the design. Follow it closely; do not redesign unless the repo proves it impossible.",
 		"",
 		"Rules:",
 		"- Make surgical, minimal changes.",
 		"- Prefer existing project conventions.",
+		"- You are the only writer. Do not behave like an independent fresh implementer; preserve previous batch decisions unless the artifacts explicitly supersede them.",
+		"- Implement or repair only the current necessary slice/batch. Do not start unrelated future work.",
 		"- Run relevant tests or checks. If no test command is configured, infer the smallest safe verification command.",
 		"- smoke evidence cannot satisfy behavioral acceptance criteria; build passed, HTTP 200, server responds, and import succeeds are baseline only.",
 		"- A cross-component seam (your code calling another lane/module/service, or a client calling a server) is only proven by an executable end-to-end check that drives the consumer against the real producer. Passing your own unit tests plus a build does not prove the seam: verify your call site's verb/path/arguments match the producer's actual contract, and that any shared semantics (e.g. the meaning of now/today, units, rounding) agree on both sides.",
@@ -2844,11 +2902,19 @@ function localWorkerPrompt(
 		`- ${config.stateDir}/frontier-design.md`,
 		`- ${config.stateDir}/repo-map.md`,
 		`- ${config.stateDir}/progress.md and ${config.stateDir}/progress.json`,
+		`- ${config.stateDir}/orchestrator-package.md if present; this is the parent Pi orchestrator's current executable package and overrides broad next-slice guessing`,
 		`- ${config.stateDir}/orchestration-brief.md and ${config.stateDir}/user-clarifications.md if present`,
 		`- ${config.stateDir}/local-review.md if present`,
 		`- ${config.stateDir}/final-review.md if present`,
 		"",
 		"If requirements.md is present in the harness state, do not create or use root REQUIREMENTS.md as a substitute requirements source.",
+		readArtifact(cwd ?? "", config, "orchestrator-package.md").trim()
+			? [
+				"",
+				"## Current Parent-Orchestrator Execution Package",
+				truncateMiddle(readArtifact(cwd ?? "", config, "orchestrator-package.md"), 30_000),
+			].join("\n")
+			: "",
 		"If local-review.md or final-review.md requests changes, prioritize those fixes without broad redesign.",
 		...interactiveValidationGuidance(task, config),
 		"Implement the next necessary slice, verify it, then summarize:",
@@ -6451,6 +6517,7 @@ function syncHarnessArtifacts(
 		"repo-map.md",
 		"frontier-design.md",
 		"orchestration-brief.md",
+		"orchestrator-package.md",
 		"plan-review.md",
 		"requirements.md",
 		"design-grill.md",
@@ -6883,6 +6950,7 @@ async function runLocalLoop(
 	cwd: string,
 	config: HarnessConfig,
 	state: HarnessState,
+	runState: HybridRunState,
 	task: string,
 	loops: number,
 	notify?: Notify,
@@ -6917,6 +6985,9 @@ async function runLocalLoop(
 			liveLabel: `worker-${iterationLabel}`,
 			rawEventPath: artifactPath(cwd, config, "events.jsonl"),
 			onLog: liveLog,
+			sessionPolicy: config.persistentWriterSession ? "persistent" : "ephemeral",
+			sessionId: runState.writerSessionId,
+			sessionDir: hybridWriterSessionDir(cwd, config, runState.writerSessionDir),
 		});
 		logParts.push(
 			`\n## Iteration ${iterationLabel}`,
@@ -7474,6 +7545,7 @@ async function runHandoffLaneLoop(
 	cwd: string,
 	config: HarnessConfig,
 	state: HarnessState,
+	runState: HybridRunState,
 	manifest: HandoffManifest,
 	lane: HandoffLane,
 	reporter: ReturnType<typeof createHybridReporter>,
@@ -7494,6 +7566,9 @@ async function runHandoffLaneLoop(
 			liveLabel: `handoff-worker-${lane.id}.${attempt}`,
 			rawEventPath: artifactPath(cwd, config, "events.jsonl"),
 			onLog: liveLog,
+			sessionPolicy: config.persistentWriterSession ? "persistent" : "ephemeral",
+			sessionId: runState.writerSessionId,
+			sessionDir: hybridWriterSessionDir(cwd, config, runState.writerSessionDir),
 		});
 		const existingLog = readArtifact(cwd, config, "local-log.md") || `# Local Implementation Log\n\nTask: ${manifest.objective}\n`;
 		writeArtifact(
@@ -7614,6 +7689,15 @@ async function runHandoffOrchestration(options: {
 	}
 	state.task = manifest.objective;
 	saveState(options.cwd, config, state);
+	const runState = loadHybridRunState(options.cwd, config, manifest.objective, "handoff");
+	if (!options.resume) {
+		runState.writerSessionId = newHybridWriterSessionId(manifest.objective);
+		runState.writerSessionDir = config.writerSessionDir || "sessions";
+		runState.completedStages = {};
+	}
+	runState.status = "running";
+	runState.lastError = undefined;
+	saveHybridRunState(options.cwd, config, state, runState);
 	const details = createHybridRunDetails(manifest.objective, "handoff", config);
 	details.stages = [
 		{ id: "checkpoint", label: "Pre-run checkpoint", status: "pending" },
@@ -7649,7 +7733,7 @@ async function runHandoffOrchestration(options: {
 				reporter.stage(`handoff-lane-${lane.id}`, "skipped", "already done");
 				continue;
 			}
-			const ok = await runHandoffLaneLoop(options.cwd, config, state, manifest, lane, reporter, notify, liveLog);
+			const ok = await runHandoffLaneLoop(options.cwd, config, state, runState, manifest, lane, reporter, notify, liveLog);
 			if (!ok) throw new Error(`Handoff lane ${lane.id} failed after repair loop. See ${config.stateDir}/handoff-review-${lane.id}.md`);
 		}
 		// Executable seam gate: per-lane green does not prove the consumer<->producer integration.
@@ -7733,6 +7817,135 @@ async function runHandoffOrchestration(options: {
 	}
 }
 
+async function runHybridExecutionPackage(options: {
+	cwd: string;
+	ctx?: any;
+	task?: string;
+	packageId?: string;
+	executionPackage: string;
+	loops?: number;
+	debug?: boolean;
+	signal?: AbortSignal;
+	onUpdate?: (result: AgentToolResult<HybridRunDetails>) => void;
+}): Promise<HybridRunDetails> {
+	const config = loadConfig(options.cwd);
+	ensureStateDir(options.cwd, config);
+	let state = loadState(options.cwd, config);
+	const task = (options.task ?? state.task ?? readArtifact(options.cwd, config, "task.md").replace(/^# Task\s*/i, "").trim()).trim();
+	if (!task) throw new Error("hybrid_exec requires a task or existing hybrid task state");
+	if (!state.task) {
+		state = {
+			version: 1,
+			phase: "idle",
+			updatedAt: nowIso(),
+			task,
+			createdAt: nowIso(),
+			localWorkerModel: config.localWorkerModel,
+			localReviewerModel: config.localReviewerModel,
+			frontierModel: config.frontierModel,
+			frontierThinking: config.frontierThinking,
+			artifacts: {},
+		};
+		writeArtifact(options.cwd, config, state, "task.md", `# Task\n\n${task}\n`);
+		saveState(options.cwd, config, state);
+	}
+	const runState = loadHybridRunState(options.cwd, config, task, "default");
+	runState.status = "running";
+	runState.lastError = undefined;
+	saveHybridRunState(options.cwd, config, state, runState);
+	const packageId = options.packageId?.trim() || `package-${Date.now().toString(36)}`;
+	const packageMarkdown = [
+		"# Parent Orchestrator Execution Package",
+		"",
+		`- packageId: ${packageId}`,
+		`- task: ${task}`,
+		`- debug: ${options.debug === true}`,
+		`- createdAt: ${nowIso()}`,
+		`- writerSessionId: ${runState.writerSessionId}`,
+		"",
+		"## Contract",
+		"",
+		"This package was produced by the active parent Pi orchestrator session. The harness should execute it with the persistent single-writer session, collect evidence, run focused verification, and return artifacts for the parent orchestrator to decide the next package.",
+		"",
+		"## Package",
+		"",
+		options.executionPackage.trim(),
+		"",
+	].join("\n");
+	writeArtifact(options.cwd, config, state, "orchestrator-package.md", packageMarkdown);
+	if (!readArtifact(options.cwd, config, "progress.json").trim()) {
+		writeProgress(options.cwd, config, state, fallbackProgress(task));
+	}
+	const details = createHybridRunDetails(task, "default", config);
+	const reporter = createHybridReporter(details, options.onUpdate, options.ctx);
+	const notify: Notify = (message, type = "info") => {
+		options.ctx?.ui?.notify?.(message, type);
+		reporter.log(`[notice] ${message}`);
+	};
+	const baseLiveLog = createLiveLogger(options.cwd, config, state, options.ctx);
+	const liveLog: LiveLog = (line) => {
+		baseLiveLog(line);
+		reporter.log(line);
+	};
+	(liveLog as any).onEvent = (label: string, event: any) => reporter.childEvent(label, event);
+	(liveLog as any).signal = options.signal ?? options.ctx?.signal;
+	try {
+		reporter.stage("local-loop", "running", `parent package ${packageId}`);
+		const testPassed = await runLocalLoop(
+			options.cwd,
+			config,
+			state,
+			runState,
+			task,
+			Math.max(1, Math.floor(options.loops ?? (options.debug ? config.maxLocalLoops : 1))),
+			notify,
+			packageId,
+			liveLog,
+		);
+		reporter.stage("local-loop", "done", `package=${packageId}; tests=${testPassed ? "passed" : config.testCommand ? "not passed" : "not configured"}`);
+		const finish = finishHybridArtifacts(options.cwd, config, state, task, notify);
+		reporter.setProgress(finish.progress);
+		reporter.stage("finish", "done", `verification=${finish.summary.allPassed ? "passed" : finish.summary.commands.length ? "failed" : "not configured"}`);
+		const review = await runLocalReview(options.cwd, config, state, notify, liveLog);
+		details.localVerdict = review.verdict;
+		reporter.stage("local-review", review.verdict === "FAIL" ? "failed" : "done", localReviewSummary(review.verdict, readArtifact(options.cwd, config, "local-review.md")));
+		writeArtifact(options.cwd, config, state, "usage-summary.md", usageSummaryMarkdown(options.cwd, config));
+		writeArtifact(
+			options.cwd,
+			config,
+			state,
+			"run-summary.md",
+			[
+				"# Hybrid Exec Package Summary",
+				"",
+				`- packageId: ${packageId}`,
+				`- task: ${task}`,
+				`- writerSessionId: ${runState.writerSessionId}`,
+				`- configuredTestsPassed: ${testPassed}`,
+				`- verificationAllPassed: ${finish.summary.allPassed}`,
+				`- localReviewVerdict: ${review.verdict}`,
+				`- finishedAt: ${nowIso()}`,
+				"",
+				"The parent Pi orchestrator should inspect orchestrator-package.md, progress.json, local-log.md, test-evidence.md, git-summary.md, verification-summary.json, and local-review.md before deciding the next package.",
+			].join("\n"),
+		);
+		syncHarnessArtifacts(options.cwd, config, state);
+		details.status = "done";
+		details.finishedAt = nowIso();
+		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
+		details.artifacts = { ...state.artifacts };
+		reporter.stage("summary", "done", `package ${packageId} artifacts ready for parent orchestrator`);
+		return details;
+	} catch (error) {
+		details.status = "failed";
+		details.finishedAt = nowIso();
+		details.error = String(error instanceof Error ? error.stack || error.message : error);
+		details.artifacts = { ...state.artifacts };
+		markHybridRunFailure(options.cwd, config, state, runState, error);
+		return details;
+	}
+}
+
 async function runHybridOrchestration(options: {
 	cwd: string;
 	ctx?: any;
@@ -7785,6 +7998,8 @@ async function runHybridOrchestration(options: {
 		runState.frontierPass = 1;
 		runState.repairCycle = 1;
 		runState.completedStages = {};
+		runState.writerSessionId = newHybridWriterSessionId(task);
+		runState.writerSessionDir = config.writerSessionDir || "sessions";
 	}
 	runState.status = "running";
 	runState.lastError = undefined;
@@ -7818,6 +8033,7 @@ async function runHybridOrchestration(options: {
 		`- maxLocalLoops: ${config.maxLocalLoops}`,
 		`- maxReviewRepairCycles: ${config.maxReviewRepairCycles}`,
 		`- maxFrontierPasses: ${config.maxFrontierPasses}`,
+		`- writerSession: ${config.persistentWriterSession ? runState.writerSessionId : "ephemeral"}`,
 		"",
 	];
 
@@ -8303,6 +8519,7 @@ async function runHybridOrchestration(options: {
 						options.cwd,
 						config,
 						state,
+						runState,
 						task,
 						config.maxLocalLoops,
 						notify,
@@ -9317,6 +9534,78 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			theme: any,
 		) {
 			return renderHybridRunResult(result, options, theme);
+		},
+	});
+
+
+	pi.registerTool({
+		name: "hybrid_exec",
+		label: "Hybrid Exec Package",
+		description:
+			"Execute one parent-orchestrator package with the persistent single-writer session, then return review, verification, diff/evidence artifacts for the active Pi orchestrator session to decide the next package.",
+		promptSnippet:
+			"Execute the current spec-kit/orchestrator implementation package through the hybrid writer loop",
+		promptGuidelines: [
+			"Use hybrid_exec from an active parent Pi orchestrator session after spec-kit tasks are ready and you have decided the next bounded batch/package.",
+			"Pass a concrete executionPackage. The tool runs implementation/repair/debug in the persistent writer session and returns artifacts; the parent orchestrator must inspect results and decide the next package.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				task: {
+					type: "string",
+					description: "Overall feature/task goal; optional if an active hybrid task exists",
+				},
+				packageId: {
+					type: "string",
+					description: "Stable ID for this orchestrator package/batch, e.g. T003 or B02-repair",
+				},
+				executionPackage: {
+					type: "string",
+					description: "The bounded implementation/repair/debug package produced by the parent Pi orchestrator",
+				},
+				loops: {
+					type: "number",
+					description: "Maximum local writer loops for this package; defaults to 1, or maxLocalLoops for debug=true",
+				},
+				debug: {
+					type: "boolean",
+					description: "Treat package as a debug/failure-cluster loop and allow the configured local loop count by default",
+				},
+			},
+			required: ["executionPackage"],
+			additionalProperties: false,
+		} as any,
+		async execute(
+			_toolCallId: string,
+			params: HybridExecParams,
+			signal: AbortSignal,
+			onUpdate:
+				| ((result: AgentToolResult<HybridRunDetails>) => void)
+				| undefined,
+			ctx: any,
+		) {
+			const details = await runHybridExecutionPackage({
+				cwd: ctx.cwd,
+				ctx,
+				task: params.task,
+				packageId: params.packageId,
+				executionPackage: params.executionPackage,
+				loops: params.loops,
+				debug: params.debug,
+				signal,
+				onUpdate,
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text: hybridDetailsToMarkdown(details, true),
+					},
+				],
+				details,
+				isError: details.status === "failed",
+			};
 		},
 	});
 
