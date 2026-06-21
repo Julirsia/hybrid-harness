@@ -370,8 +370,8 @@ const DEFAULT_CONFIG: HarnessConfig = {
 	localBaseUrl: "http://192.168.0.44:8080/v1",
 	localProvider: "local-qwen",
 	localApiKey: "local",
-	localWorkerModel: "local-qwen/qwen36-27b-mtp-iq4xs",
-	localReviewerModel: "local-qwen/qwen36-27b-mtp-iq4xs",
+	localWorkerModel: "local-qwen/qwen36-27b-mtp-q5kxl",
+	localReviewerModel: "local-qwen/qwen36-27b-mtp-q5kxl",
 	frontierModel: "openai-codex/gpt-5.5",
 	frontierThinking: "high",
 	frontierInputCostPerMTok: 0,
@@ -8943,8 +8943,8 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			apiKey: startupConfig.localApiKey,
 			models: [
 				{
-					id: "qwen36-27b-mtp-iq4xs",
-					name: "Qwen3.6-27B MTP IQ4_XS",
+					id: "qwen36-27b-mtp-q5kxl",
+					name: "Qwen3.6-27B MTP Q5_K_XL",
 					reasoning: false,
 					input: ["text"],
 					contextWindow: 131_000,

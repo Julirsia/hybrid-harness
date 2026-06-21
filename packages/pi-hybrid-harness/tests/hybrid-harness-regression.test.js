@@ -35,8 +35,8 @@ test("package exposes spec-kit hybrid orchestrator skill", () => {
 
 test("default local reviewer matches the worker model", () => {
 	const block = between("const DEFAULT_CONFIG", "function statePath");
-	assert.match(block, /localWorkerModel: "local-qwen\/qwen36-27b-mtp-iq4xs"/);
-	assert.match(block, /localReviewerModel: "local-qwen\/qwen36-27b-mtp-iq4xs"/);
+	assert.match(block, /localWorkerModel: "local-qwen\/qwen36-27b-mtp-q5kxl"/);
+	assert.match(block, /localReviewerModel: "local-qwen\/qwen36-27b-mtp-q5kxl"/);
 });
 
 test("report overlays use the custom UI whenever interactive UI is available", () => {
