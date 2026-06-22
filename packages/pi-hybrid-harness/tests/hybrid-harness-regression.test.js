@@ -108,7 +108,9 @@ test("hybrid monitor normalizes tabs before wrapping live output", () => {
 });
 
 test("local child runs record rough token estimates without persisting raw output", () => {
-	assert.match(source, /function estimateRoughTokenCount/);
+	// estimateRoughTokenCount now lives in src/text.ts (behavior covered by src-text.test.ts);
+	// here we only assert it stays wired into the extension entry.
+	assert.match(source, /import \{[^}]*\bestimateRoughTokenCount\b[^}]*\} from "\.\.\/src\/text\.ts"/);
 	const runBlock = between("async function runPiOnce", "async function fetchLocalModels");
 	assert.match(runBlock, /estimatedInput: estimateRoughTokenCount\(options\.prompt\)/);
 	assert.match(runBlock, /estimateRoughTokenCount\(output\)/);
@@ -168,9 +170,14 @@ test("hybrid live monitor prioritizes Korean interactive status", () => {
 });
 
 test("progress reconciliation accepts completion aliases and rewrites canonical markdown", () => {
-	assert.match(source, /function normalizeSliceStatus/);
-	assert.match(source, /function normalizeCriterionStatus/);
-	assert.match(source, /case "complete":/);
+	// Status normalizers now live in src/progress-status.ts (alias behavior such as
+	// "complete" -> done is covered by src-progress-status.test.ts); assert wiring here.
+	const progressStatusImport = between(
+		'from "../src/verdicts.ts"',
+		'from "../src/progress-status.ts"',
+	);
+	assert.match(progressStatusImport, /\bnormalizeSliceStatus\b/);
+	assert.match(progressStatusImport, /\bnormalizeCriterionStatus\b/);
 	assert.match(source, /function reconcileHybridCompletion/);
 	const reconcileBlock = between("function reconcileHybridCompletion", "async function runHybridStart");
 	assert.match(reconcileBlock, /status: "done"/);
@@ -190,15 +197,35 @@ test("finishing step records structured verification summary and syncs state art
 });
 
 test("verification rejects false-green runtime output and includes lint", () => {
-	assert.match(source, /function fatalVerificationSignals/);
-	assert.match(source, /EADDRINUSE/);
-	assert.match(source, /function verificationCommandPassed/);
-	assert.match(source, /fatalSignals\.length === 0/);
+	// fatalVerificationSignals / verificationCommandPassed now live in src/verification.ts
+	// (false-green EADDRINUSE detection covered by src-verification.test.ts); assert wiring.
+	const verificationImport = between(
+		'from "../src/safety.ts"',
+		'from "../src/verification.ts"',
+	);
+	assert.match(verificationImport, /\bfatalVerificationSignals\b/);
+	assert.match(verificationImport, /\bverificationCommandPassed\b/);
 	const inferBlock = between("function inferVerificationCommands", "function verificationCommands");
 	assert.match(inferBlock, /scripts\.lint/);
 	assert.match(inferBlock, /npm run lint/);
 	const integrationBlock = between("function runHandoffIntegrationGate", "function updateHandoffLaneProgress");
 	assert.match(integrationBlock, /verificationCommandPassed\(test, expected\)/);
+});
+
+test("design stage fails (not silently completes) when scout/architect runs are unusable", () => {
+	// isUsableChildResult behavior is covered by src-verdicts.test.ts; here we assert the
+	// design stage is actually guarded so a timed-out/empty child can't be captured as success.
+	const startBlock = between("async function runHybridStart", "async function runLocalLoop");
+	assert.match(startBlock, /if \(!isUsableChildResult\(scout\)\)/);
+	assert.match(startBlock, /if \(!isUsableChildResult\(architect\)\)/);
+	assert.match(startBlock, /no usable repo map/);
+	assert.match(startBlock, /no usable design/);
+	// The architect guard must run before progress.json is written, otherwise a failed design
+	// would satisfy the resume readiness check and be skipped.
+	const architectGuard = startBlock.indexOf("if (!isUsableChildResult(architect))");
+	const progressWrite = startBlock.indexOf("createProgressFromDesign(cwd");
+	assert.ok(architectGuard !== -1 && progressWrite !== -1);
+	assert.ok(architectGuard < progressWrite, "architect guard must precede createProgressFromDesign");
 });
 
 test("handoff completion requires an approving frontier final gate", () => {
@@ -383,7 +410,7 @@ test("hybrid run render normalizes partial live details before reading task", ()
 	assert.doesNotMatch(renderBlock, /buildHybridRunComponent\(details,/);
 	const liveMessageBlock = between(
 		"class HybridLiveMessageComponent",
-		"function parseLocalVerdict",
+		"function summaryValue",
 	);
 	assert.match(liveMessageBlock, /normalizeHybridRunDetailsForRender\(/);
 });
@@ -663,23 +690,41 @@ test("plan review prompt uses portable architect and critic rubrics", () => {
 	assert.match(block, /runtimeEvidence/);
 });
 
-test("quality-impacting review gates route to frontier model", () => {
+test("plan review is frontier; implementation review defaults to frontier but hybrid_exec routes to local", () => {
 	const planReviewBlock = between("async function runPlanReview", "async function createProgressFromDesign");
 	assert.match(planReviewBlock, /FRONTIER PLAN REVIEWER/);
 	assert.match(planReviewBlock, /model: config\.frontierModel/);
 	assert.match(planReviewBlock, /thinking: config\.frontierThinking/);
 	assert.doesNotMatch(planReviewBlock, /model: config\.localReviewerModel/);
 
-	const implementationReviewBlock = between("async function runLocalReview", "async function runFrontierFinal");
-	assert.match(implementationReviewBlock, /FRONTIER IMPLEMENTATION REVIEWER/);
-	assert.match(implementationReviewBlock, /model: config\.frontierModel/);
-	assert.match(implementationReviewBlock, /thinking: config\.frontierThinking/);
-	assert.match(implementationReviewBlock, /# Frontier Implementation Review/);
-	assert.doesNotMatch(implementationReviewBlock, /# Local Review/);
-	assert.doesNotMatch(implementationReviewBlock, /model: config\.localReviewerModel/);
+	// runLocalReview is parameterized by an ImplementationReviewer. The default is frontier
+	// (used by /hybrid-run's auto loop and the manual /hybrid-review command); hybrid_exec
+	// overrides it with the local reviewer so frontier tokens are reserved for /hybrid-final.
+	const frontierReviewerBlock = between(
+		"function frontierImplementationReviewer",
+		"function localImplementationReviewer",
+	);
+	assert.match(frontierReviewerBlock, /model: config\.frontierModel/);
+	assert.match(frontierReviewerBlock, /thinking: config\.frontierThinking/);
+	assert.match(frontierReviewerBlock, /FRONTIER IMPLEMENTATION REVIEWER/);
+	const localReviewerBlock = between(
+		"function localImplementationReviewer",
+		"async function runLocalReview",
+	);
+	assert.match(localReviewerBlock, /model: config\.localReviewerModel/);
+	assert.match(localReviewerBlock, /LOCAL IMPLEMENTATION REVIEWER/);
 
-	const usageBlock = between("function usageSummaryMarkdown", "function statusMarkdown");
-	assert.match(usageBlock, /\{ name: "local-review\.md", bucket: "frontier" \}/);
+	// Default parameter binds the frontier reviewer.
+	assert.match(
+		source,
+		/reviewer: ImplementationReviewer = frontierImplementationReviewer\(config\)/,
+	);
+
+	// hybrid_exec (parent-driven) passes the local reviewer; the /hybrid-run auto loop does not.
+	const execBlock = between("async function runHybridExecutionPackage", "async function runHybridOrchestration");
+	assert.match(execBlock, /runLocalReview\([\s\S]*?localImplementationReviewer\(config\)/);
+	const orchestrationBlock = between("async function runHybridOrchestration", "export default async function hybridHarness");
+	assert.doesNotMatch(orchestrationBlock, /localImplementationReviewer\(/);
 
 	const detailsBlock = between("function createHybridRunDetails", "function normalizeHybridRunDetailsForRender");
 	assert.match(detailsBlock, /id: "local-review", label: "Frontier implementation review"/);

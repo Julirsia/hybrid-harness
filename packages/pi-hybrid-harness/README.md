@@ -208,7 +208,10 @@ For ambiguous requirements or broad designs, use `/hybrid-interview` and `/hybri
 
 For serious tasks, the harness automatically runs a CWS-compatible, not CWS-dependent frontier `plan-review` stage after the orchestration brief and before the local implementation loop. `taskRisk=medium` or `taskRisk=high` must produce `plan-review.md` with plan architect and plan critic verdicts; local implementation starts only when the final verdict is `READY`. `NEEDS_REVISION` and `ESCALATE_TO_USER` block the run. If `briefBeforeImplementation=false`, the harness still creates a one-off brief so the serious-task policy can be evaluated.
 
-Quality-impacting gates are frontier-owned: plan review, implementation review, and final review use `frontierModel` and `frontierThinking`. The legacy `local-review.md` artifact name is retained for resume compatibility, but it records a frontier implementation review.
+Review routing depends on the mode:
+
+- `/hybrid-run` (fully automatic): plan review, implementation review, and final review all use `frontierModel`/`frontierThinking`. The `local-review.md` artifact records a frontier implementation review in this mode.
+- `hybrid_exec` (parent-driven spec-kit/skill mode): each package runs deterministic verification (test/lint/build commands) plus an implementation review by the **local** `localReviewerModel`, and writes the verdict to `local-review.md`. Frontier tokens are not spent per package. Reserve the frontier model for the single ship decision: run `/hybrid-final` once the whole feature is complete. This matches the parent-driven loop where the parent orchestrator session (itself frontier) reads the per-package artifacts and decides the next package, repair, debug, or stop.
 
 Reviewer prompts require test assertion-quality review, at least one adversarial probe, and reentry/idempotency checks for stateful work. Residual gaps block approval for public API, data integrity, authentication, payment, migration, or long-lived state changes.
 

@@ -10,9 +10,10 @@ Use this skill after spec-kit has produced implementation-ready `spec.md`, `plan
 ## Role split
 
 - Active parent Pi session: persistent orchestrator. Read spec-kit artifacts, decide the next bounded batch, inspect harness results, and choose next package/repair/debug/stop.
-- `hybrid_exec` tool: execution runtime. It receives one concrete `executionPackage`, runs the persistent single-writer implementation/repair loop, runs verification/review, and returns artifact references.
+- `hybrid_exec` tool: execution runtime. It receives one concrete `executionPackage`, runs the persistent single-writer implementation loop, runs deterministic verification (test/lint/build commands), runs a local-reviewer implementation review, and returns artifact references. It does not loop on review failure and does not call the frontier model — the parent drives the loop.
 - Hybrid writer session: persistent single writer. It implements/repairs/debugs across packages without losing context.
-- Review/final gates: fresh/read-only; do not rely on writer self-approval.
+- Per-package review is fresh/read-only and runs on the **local** `localReviewerModel`; do not rely on writer self-approval. Frontier tokens are reserved for the single final ship decision.
+- Final gate: run `/hybrid-final` once, after all packages are complete and verification is clean. This is the only step that spends the frontier model in this mode.
 
 ## Loop
 
@@ -35,6 +36,7 @@ Use this skill after spec-kit has produced implementation-ready `spec.md`, `plan
    - debug package if full tests fail;
    - escalate/ask user if requirements/design conflict, public API/schema/security/data decisions changed, or the same failure repeats.
 6. Repeat until all spec-kit tasks are complete and final verification is clean.
+7. Run `/hybrid-final` once for the frontier ship decision (APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER). This is the only frontier-model gate in this mode; per-package reviews were local.
 
 ## Execution package template
 
