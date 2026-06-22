@@ -247,7 +247,9 @@ test("local loop breaks early when the writer makes no workspace changes", () =>
 	assert.match(source, /function workspaceSignature/);
 	const loopBlock = between("async function runLocalLoop", "async function runLocalReview");
 	assert.match(loopBlock, /const signatureBefore = workspaceSignature\(cwd, config\)/);
-	assert.match(loopBlock, /workspaceSignature\(cwd, config\) === signatureBefore/);
+	// compared against a post-writer snapshot so test/build side effects can't mask a no-op
+	assert.match(loopBlock, /const signatureAfterWriter = workspaceSignature\(cwd, config\)/);
+	assert.match(loopBlock, /signatureAfterWriter === signatureBefore/);
 	assert.match(loopBlock, /no workspace changes/);
 });
 
@@ -262,10 +264,15 @@ test("hybrid_exec surfaces convergence and orchestrator directives in run-summar
 	assert.match(execBlock, /extractReviewBlockers\(/);
 	assert.match(execBlock, /repeatedNonProgressCount/);
 	assert.match(execBlock, /- convergence: \$\{convergence\}/);
+	// verification: ran commands must pass; no applicable commands only OK for non-interactive
+	assert.match(execBlock, /finish\.summary\.commands\.length > 0/);
+	assert.match(execBlock, /!interactivePolicyActive/);
 	// the directives helper emits the actionable section + blocker targeting
 	const directivesBlock = between("function orchestratorDirectivesMarkdown", "async function runHybridExecutionPackage");
 	assert.match(directivesBlock, /## Orchestrator directives/);
 	assert.match(directivesBlock, /SETUP GAP: progress\.json is still the generic single-slice fallback/);
+	// SETUP GAP must be suppressed when the package already completed
+	assert.match(directivesBlock, /input\.fallbackProgress && input\.convergence !== "complete"/);
 	assert.match(directivesBlock, /high-risk/);
 	assert.match(directivesBlock, /Target these review findings/);
 });

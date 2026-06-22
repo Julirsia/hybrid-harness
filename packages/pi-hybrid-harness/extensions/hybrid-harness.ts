@@ -6972,6 +6972,9 @@ async function runLocalLoop(
 			sessionId: runState.writerSessionId,
 			sessionDir: hybridWriterSessionDir(cwd, config, runState.writerSessionDir),
 		});
+		// Capture the signature right after the writer, before the verification/test
+		// command runs, so a test or build that writes files cannot mask a no-op writer.
+		const signatureAfterWriter = workspaceSignature(cwd, config);
 		logParts.push(
 			`\n## Iteration ${iterationLabel}`,
 			"",
@@ -7071,7 +7074,7 @@ async function runLocalLoop(
 		// If the writer changed nothing this iteration, repeating it with the same
 		// context will not help. Break early instead of burning the remaining loops on
 		// no-op iterations (the DEBUG-1.2..4 "No changes made" failure mode).
-		if (i < loops && workspaceSignature(cwd, config) === signatureBefore) {
+		if (i < loops && signatureAfterWriter === signatureBefore) {
 			const noopNote = `Writer made no workspace changes in iteration ${iterationLabel}; ending the local loop early instead of repeating no-op iterations.`;
 			notify?.(noopNote, "warning");
 			logParts.push("", `> ${noopNote}`, "");
@@ -7938,10 +7941,12 @@ function orchestratorDirectivesMarkdown(input: {
 			`WARNING: ${input.repeatedNonProgressCount} consecutive packages made no real progress. Stop repeating packages — change strategy or escalate to the user.`,
 		);
 	}
-	if (input.fallbackProgress) {
+	// Only nag about decomposition when the package did not complete: a finished
+	// one-off package legitimately keeps the generic single-slice progress.
+	if (input.fallbackProgress && input.convergence !== "complete") {
 		lines.push(
 			"",
-			"SETUP GAP: progress.json is still the generic single-slice fallback. Decompose spec-kit tasks.md into real slices and acceptance criteria in progress.json, and keep tasks.md checkboxes in sync.",
+			"SETUP GAP: progress.json is still the generic single-slice fallback. Populate it with real slices and acceptance criteria (decompose tasks.md if using spec-kit), and keep tasks.md checkboxes in sync.",
 		);
 	}
 	if (input.uncheckedCanonicalTasks) {
@@ -8087,13 +8092,16 @@ async function runHybridExecutionPackage(options: {
 			task,
 		);
 		const hasDeterministicTest = hasBehavioralTestCommand(options.cwd, config);
+		// If verification commands ran, they must pass. If none were applicable, don't
+		// block completion on verification for a non-interactive task (review is the gate);
+		// interactive tasks are still gated by hasDeterministicTest in assessConvergence.
+		const verificationPassed =
+			finish.summary.commands.length > 0
+				? finish.summary.allPassed
+				: !interactivePolicyActive;
 		const convergence = assessConvergence({
 			verdict: review.verdict,
-			verificationPassed: deterministicVerificationPassed(
-				options.cwd,
-				config,
-				finish.progress,
-			),
+			verificationPassed,
 			workspaceChanged,
 			interactivePolicyActive,
 			hasDeterministicTest,
