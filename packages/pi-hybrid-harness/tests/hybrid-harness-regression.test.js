@@ -33,6 +33,21 @@ test("package exposes spec-kit hybrid orchestrator skill", () => {
 	assert.match(skill, /tasks\.md/);
 });
 
+test("orchestrator skill encodes preventive rules for the observed failure modes", () => {
+	const skill = readFileSync(path.resolve("skills/spec-kit-hybrid-orchestrator/SKILL.md"), "utf8");
+	// setup gates: decompose progress + establish a behavioral test before implementation
+	assert.match(skill, /Before implementation \(setup gates\)/);
+	assert.match(skill, /Decompose `tasks\.md` into `progress\.json`/);
+	assert.match(skill, /deterministic behavioral test/i);
+	// convergence-driven decisions
+	assert.match(skill, /blocked-no-tests/);
+	assert.match(skill, /stalled/);
+	assert.match(skill, /Orchestrator directives/);
+	assert.match(skill, /highRiskResidualBlockers/);
+	// do not spin on no-progress packages
+	assert.match(skill, /Never re-send a package that produced `convergence: stalled` or `blocked-no-tests`/);
+});
+
 test("default local reviewer matches the worker model", () => {
 	const block = between("const DEFAULT_CONFIG", "function statePath");
 	assert.match(block, /localWorkerModel: "local-qwen\/qwen36-27b-mtp-q5kxl"/);
@@ -226,6 +241,71 @@ test("design stage fails (not silently completes) when scout/architect runs are 
 	const progressWrite = startBlock.indexOf("createProgressFromDesign(cwd");
 	assert.ok(architectGuard !== -1 && progressWrite !== -1);
 	assert.ok(architectGuard < progressWrite, "architect guard must precede createProgressFromDesign");
+});
+
+test("local loop breaks early when the writer makes no workspace changes", () => {
+	assert.match(source, /function workspaceSignature/);
+	const loopBlock = between("async function runLocalLoop", "async function runLocalReview");
+	assert.match(loopBlock, /const signatureBefore = workspaceSignature\(cwd, config\)/);
+	assert.match(loopBlock, /workspaceSignature\(cwd, config\) === signatureBefore/);
+	assert.match(loopBlock, /no workspace changes/);
+});
+
+test("hybrid_exec surfaces convergence and orchestrator directives in run-summary", () => {
+	// assessConvergence/isFallbackProgress behavior is covered by src-orchestration-signals.test.ts;
+	// here we assert hybrid_exec computes and surfaces them so the parent cannot miss a stall.
+	const execBlock = between("async function runHybridExecutionPackage", "async function runHybridOrchestration");
+	assert.match(execBlock, /const packageSignatureBefore = workspaceSignature\(options\.cwd, config\)/);
+	assert.match(execBlock, /assessConvergence\(/);
+	assert.match(execBlock, /hasBehavioralTestCommand\(options\.cwd, config\)/);
+	assert.match(execBlock, /orchestratorDirectivesMarkdown\(/);
+	assert.match(execBlock, /extractReviewBlockers\(/);
+	assert.match(execBlock, /repeatedNonProgressCount/);
+	assert.match(execBlock, /- convergence: \$\{convergence\}/);
+	// the directives helper emits the actionable section + blocker targeting
+	const directivesBlock = between("function orchestratorDirectivesMarkdown", "async function runHybridExecutionPackage");
+	assert.match(directivesBlock, /## Orchestrator directives/);
+	assert.match(directivesBlock, /SETUP GAP: progress\.json is still the generic single-slice fallback/);
+	assert.match(directivesBlock, /high-risk/);
+	assert.match(directivesBlock, /Target these review findings/);
+});
+
+test("convergence is surfaced in the run details, card, monitor, and status (UX)", () => {
+	// HybridRunDetails carries the signal and hybrid_exec sets it.
+	assert.match(source, /convergence\?: Convergence;/);
+	const execBlock = between("async function runHybridExecutionPackage", "async function runHybridOrchestration");
+	assert.match(execBlock, /details\.convergence = convergence/);
+	// markdown fallback card shows it
+	const cardBlock = between("function hybridDetailsToMarkdown", "type HybridModelConfigKey");
+	assert.match(cardBlock, /Convergence: \$\{details\.convergence\}/);
+	// rich card + monitor share koreanHybridRunOverviewLines, which renders convergence
+	const overviewBlock = between("function koreanHybridRunOverviewLines", "function hybridStageFlowLine");
+	assert.match(overviewBlock, /details\.convergence/);
+	assert.match(overviewBlock, /hybridConvergenceKo\(/);
+});
+
+test("status widget leads with glanceable info and convergence (UX truncation fix)", () => {
+	const statusBlock = between("function statusMarkdown", "function setStatusWidget");
+	// convergence summary is read from run-state and shown in the Korean lead block
+	assert.match(statusBlock, /lastPackageConvergence/);
+	assert.match(statusBlock, /수렴 상태/);
+	// the static stage reference is moved below Artifacts so the first ~18 lines stay useful
+	const koreanIdx = statusBlock.indexOf("수렴 상태");
+	const artifactsIdx = statusBlock.indexOf('"## Artifacts"');
+	const stageRefIdx = statusBlock.indexOf("hybridStageReferenceMarkdown()");
+	assert.ok(koreanIdx !== -1 && artifactsIdx !== -1 && stageRefIdx !== -1);
+	assert.ok(koreanIdx < artifactsIdx, "convergence summary must lead, before Artifacts");
+	assert.ok(artifactsIdx < stageRefIdx, "stage reference must move below Artifacts");
+});
+
+test("onboarding: endpoint env override and doctor remediation (UX)", () => {
+	const loadBlock = between("function loadConfig", "function statePath");
+	assert.match(loadBlock, /HYBRID_LOCAL_BASE_URL/);
+	assert.match(loadBlock, /envConfig\.localBaseUrl/);
+	const doctorBlock = between('pi.registerCommand("hybrid-doctor"', 'pi.registerCommand("hybrid-status"');
+	assert.match(doctorBlock, /## How to fix/);
+	assert.match(doctorBlock, /HYBRID_LOCAL_BASE_URL/);
+	assert.match(doctorBlock, /failedChecks/);
 });
 
 test("handoff completion requires an approving frontier final gate", () => {
@@ -451,7 +531,7 @@ test("hybrid status reports active run lock and queued steering", () => {
 	assert.match(block, /readHybridRunLock\(cwd,\s*config\)/);
 	assert.match(block, /readHybridSteering\(cwd,\s*config\)/);
 	assert.match(block, /## Active Run/);
-	assert.match(block, /Queued steering/);
+	assert.match(block, /대기 중인 steering 메모/);
 });
 
 test("monitor has explicit two-step cancel while esc only closes", () => {

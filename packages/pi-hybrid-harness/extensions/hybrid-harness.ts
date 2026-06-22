@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -57,6 +58,13 @@ import {
 	normalizeSliceStatus,
 	normalizeStringArray,
 } from "../src/progress-status.ts";
+import {
+	assessConvergence,
+	convergenceDirective,
+	isBehavioralTestCommand,
+	isFallbackProgress,
+	type Convergence,
+} from "../src/orchestration-signals.ts";
 
 type HarnessPhase =
 	| "idle"
@@ -244,6 +252,12 @@ interface HybridRunState {
 	writerSessionId: string;
 	writerSessionDir: string;
 	lastError?: string;
+	// Parent-driven (hybrid_exec) convergence tracking across packages, so a repeated
+	// no-progress verdict can be detected and surfaced to the orchestrator.
+	lastPackageId?: string;
+	lastPackageVerdict?: string;
+	lastPackageConvergence?: string;
+	repeatedNonProgressCount?: number;
 }
 
 interface HybridSteeringEntry {
@@ -330,6 +344,10 @@ interface HybridRunDetails {
 	};
 	localVerdict?: ReturnType<typeof parseLocalVerdict>;
 	frontierVerdict?: ReturnType<typeof parseFrontierVerdict>;
+	// Parent-driven (hybrid_exec) convergence signal, surfaced in the card/monitor/status
+	// so a stalled or test-blocked loop is visible without opening run-summary.md.
+	convergence?: Convergence;
+	repeatedNonProgress?: number;
 	frontierInputCostPerMTok?: number;
 	frontierOutputCostPerMTok?: number;
 	writerSessionId?: string;
@@ -485,8 +503,23 @@ function loadConfig(
 	const piConfig = readJsonFile<Partial<HarnessConfig>>(
 		path.join(cwd, ".pi", "hybrid-harness.json"),
 	);
+	// Environment overrides sit above the packaged defaults but below project config
+	// files, so a new user can point the harness at their own local endpoint/models
+	// without editing the shipped defaults, while a project's config.json still wins.
+	const envConfig: Partial<HarnessConfig> = {};
+	if (process.env.HYBRID_LOCAL_BASE_URL)
+		envConfig.localBaseUrl = process.env.HYBRID_LOCAL_BASE_URL;
+	if (process.env.HYBRID_LOCAL_PROVIDER)
+		envConfig.localProvider = process.env.HYBRID_LOCAL_PROVIDER;
+	if (process.env.HYBRID_LOCAL_WORKER_MODEL)
+		envConfig.localWorkerModel = process.env.HYBRID_LOCAL_WORKER_MODEL;
+	if (process.env.HYBRID_LOCAL_REVIEWER_MODEL)
+		envConfig.localReviewerModel = process.env.HYBRID_LOCAL_REVIEWER_MODEL;
+	if (process.env.HYBRID_FRONTIER_MODEL)
+		envConfig.frontierModel = process.env.HYBRID_FRONTIER_MODEL;
 	const merged = {
 		...DEFAULT_CONFIG,
+		...envConfig,
 		...piConfig,
 		...stateConfig,
 		...overrides,
@@ -1794,6 +1827,54 @@ function workspaceManifestMarkdown(cwd: string, config?: HarnessConfig): string 
 	].join("\n");
 }
 
+// Content-independent signature of the editable workspace (source files only), used
+// to detect when a writer iteration/package made no changes. Works with or without
+// git. Excludes build output, deps, and harness state so a verification build that
+// writes dist/ does not register as a source change.
+function workspaceSignature(cwd: string, config: HarnessConfig): string {
+	const ignored = new Set([
+		".git",
+		"node_modules",
+		".DS_Store",
+		".next",
+		".nuxt",
+		".cache",
+		"coverage",
+		"dist",
+		"build",
+		config.stateDir,
+	]);
+	const parts: string[] = [];
+	const walk = (dir: string) => {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (ignored.has(entry.name)) continue;
+			if (entry.isSymbolicLink()) continue;
+			const absolute = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				walk(absolute);
+				continue;
+			}
+			if (!entry.isFile()) continue;
+			try {
+				const stat = fs.statSync(absolute);
+				const rel = path.relative(cwd, absolute).replace(/\\/g, "/");
+				parts.push(`${rel}:${stat.size}:${Math.round(stat.mtimeMs)}`);
+			} catch {
+				// ignore unreadable entries
+			}
+		}
+	};
+	walk(cwd);
+	parts.sort();
+	return crypto.createHash("sha1").update(parts.join("\n")).digest("hex");
+}
+
 function gitSummary(cwd: string, config?: HarnessConfig): string {
 	if (!isGitRepository(cwd)) {
 		return [
@@ -2666,6 +2747,24 @@ function statusMarkdown(
 					: "- cancel requested: no",
 			].join("\n")
 		: "- none";
+	const runStateRaw = readJsonFile<HybridRunState>(
+		artifactPath(cwd, config, "run-state.json"),
+	);
+	const convergence = runStateRaw?.lastPackageConvergence;
+	const repeatedNonProgress = runStateRaw?.repeatedNonProgressCount ?? 0;
+	const convergenceSummaryKo = (() => {
+		if (!convergence) return "기록 없음 (hybrid_exec 실행 시 갱신)";
+		const known = ["complete", "progressing", "stalled", "blocked-no-tests"].includes(
+			convergence,
+		);
+		const label = known
+			? hybridConvergenceKo(convergence as Convergence).label
+			: convergence;
+		return `${label}${repeatedNonProgress >= 2 ? ` (무진전 ${repeatedNonProgress}회)` : ""}`;
+	})();
+	// Glanceable dynamic summary first: setStatusWidget only shows the first ~18 lines,
+	// so phase/task/active-run/convergence must lead. Static reference + verbose config
+	// go to the bottom of the full document.
 	return [
 		"# Hybrid Harness Status",
 		"",
@@ -2673,32 +2772,13 @@ function statusMarkdown(
 		"",
 		`- 현재 상태: ${state.phase}`,
 		`- 작업: ${state.task ?? "아직 설정되지 않음"}`,
-		`- 상태 디렉터리: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
-		`- 실행 중인 백그라운드 작업: ${activeLock ? `${activeLock.currentStage ?? "unknown"} (${activeLock.liveId})` : "없음"}`,
+		`- 실행 중인 백그라운드 작업: ${activeLock ? `${activeLock.currentStage ?? "unknown"} (${activeLock.liveId})${activeLock.cancelRequestedAt ? " · 취소 요청됨" : ""}${isHybridRunLockStale(activeLock) ? " · stale" : ""}` : "없음"}`,
+		`- 수렴 상태: ${convergenceSummaryKo}`,
 		`- 대기 중인 steering 메모: ${queuedSteering}개`,
 		`- writer 세션: ${writerSession.id ?? "아직 생성되지 않음"}`,
-		`- 사람이 확인할 주요 문서: ${config.stateDir}/requirements.md, ${config.stateDir}/progress.md, ${config.stateDir}/run-summary.md`,
-		"",
-		...hybridStageReferenceMarkdown().split("\n"),
-		"",
-		`- Phase: **${state.phase}**`,
-		`- State dir: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
-		`- Local worker: \`${config.localWorkerModel}\``,
-		`- Local reviewer: \`${config.localReviewerModel}\``,
-		`- Frontier: \`${config.frontierModel}\` (${config.frontierThinking})`,
-		`- Frontier cost rates: input=$${config.frontierInputCostPerMTok}/MTok output=$${config.frontierOutputCostPerMTok}/MTok`,
-		`- Verification commands: ${config.verificationCommands.length ? config.verificationCommands.map((command) => `\`${command}\``).join(", ") : config.testCommand ? `\`${config.testCommand}\`` : "auto-detect"}`,
-		`- Non-git manifest review: ${config.allowManifestReviewWhenNoGit ? "allowed" : "blocked"}`,
-		`- Live child output: ${config.verboseChildOutput ? "on" : "off"}`,
-		`- Safety guards: ${config.enableSafetyGuards ? "on" : "off"}; destructive bash: ${config.allowDestructiveBash ? "allowed" : "blocked"}`,
-		`- Local loops per cycle: ${config.maxLocalLoops}`,
-		`- Review repair cycles: ${config.maxReviewRepairCycles}`,
-		`- Frontier passes: ${config.maxFrontierPasses}`,
-		`- Test command: ${config.testCommand ? `\`${config.testCommand}\`` : "not configured"}`,
-		`- Interactive deterministic-test policy: ${config.requireDeterministicTestsForInteractive ? "on" : "off"}`,
-		state.task ? `- Task: ${state.task}` : "- Task: not set",
-		`- Queued steering: ${queuedSteering}`,
-		`- Updated: ${state.updatedAt}`,
+		`- 상태 디렉터리: \`${path.relative(cwd, path.join(cwd, config.stateDir)) || config.stateDir}\``,
+		`- 사람이 확인할 주요 문서: ${config.stateDir}/run-summary.md, ${config.stateDir}/progress.md, ${config.stateDir}/requirements.md`,
+		`- 업데이트: ${state.updatedAt}`,
 		"",
 		"## Active Run",
 		activeRunLines,
@@ -2706,8 +2786,23 @@ function statusMarkdown(
 		"## Persistent Writer Session",
 		writerSessionLines,
 		"",
+		"## Configuration",
+		`- Local worker: \`${config.localWorkerModel}\``,
+		`- Local reviewer: \`${config.localReviewerModel}\``,
+		`- Frontier: \`${config.frontierModel}\` (${config.frontierThinking})`,
+		`- Frontier cost rates: input=$${config.frontierInputCostPerMTok}/MTok output=$${config.frontierOutputCostPerMTok}/MTok`,
+		`- Verification commands: ${config.verificationCommands.length ? config.verificationCommands.map((command) => `\`${command}\``).join(", ") : config.testCommand ? `\`${config.testCommand}\`` : "auto-detect"}`,
+		`- Test command: ${config.testCommand ? `\`${config.testCommand}\`` : "not configured"}`,
+		`- Interactive deterministic-test policy: ${config.requireDeterministicTestsForInteractive ? "on" : "off"}`,
+		`- Non-git manifest review: ${config.allowManifestReviewWhenNoGit ? "allowed" : "blocked"}`,
+		`- Live child output: ${config.verboseChildOutput ? "on" : "off"}`,
+		`- Safety guards: ${config.enableSafetyGuards ? "on" : "off"}; destructive bash: ${config.allowDestructiveBash ? "allowed" : "blocked"}`,
+		`- Loops: local=${config.maxLocalLoops} · review repair=${config.maxReviewRepairCycles} · frontier passes=${config.maxFrontierPasses}`,
+		"",
 		"## Artifacts",
 		artifactLines || "(none)",
+		"",
+		...hybridStageReferenceMarkdown().split("\n"),
 	].join("\n");
 }
 
@@ -3657,6 +3752,31 @@ function hybridStatusKo(status: HybridRunDetails["status"]): string {
 	return "완료";
 }
 
+function hybridConvergenceKo(convergence: Convergence): {
+	label: string;
+	tone: string;
+	hint?: string;
+} {
+	switch (convergence) {
+		case "complete":
+			return { label: "완료", tone: "success" };
+		case "progressing":
+			return { label: "진행 중", tone: "accent" };
+		case "stalled":
+			return {
+				label: "교착 — 변경 없음",
+				tone: "warning",
+				hint: "같은 패키지 재전송 금지. 블로커를 타겟하거나 escalate.",
+			};
+		case "blocked-no-tests":
+			return {
+				label: "막힘 — 행동 테스트 없음",
+				tone: "error",
+				hint: "런타임/e2e 테스트를 추가하거나 escalate. 구현/디버그 패키지 추가 금지.",
+			};
+	}
+}
+
 function hybridStageStatusKo(status: HybridStageStatus): string {
 	if (status === "running") return "진행 중";
 	if (status === "done") return "완료";
@@ -3765,6 +3885,15 @@ function koreanHybridRunOverviewLines(
 		if (p.nextAction) {
 			lines.push(`${fg("dim", "다음 행동")} ${truncateMiddle(p.nextAction, 180)}`);
 		}
+	}
+	if (details.convergence) {
+		const cv = hybridConvergenceKo(details.convergence);
+		const repeat =
+			details.repeatedNonProgress && details.repeatedNonProgress >= 2
+				? ` · 무진전 ${details.repeatedNonProgress}회`
+				: "";
+		lines.push(`${fg("dim", "수렴")} ${statusBadge(theme, cv.label, cv.tone)}${repeat}`);
+		if (cv.hint) lines.push(`${fg(cv.tone, "→")} ${cv.hint}`);
 	}
 	if (currentChild) {
 		lines.push(`${fg("dim", "최근 활동")} ${childActivity(currentChild, now)}`);
@@ -4340,6 +4469,19 @@ function hybridDetailsToMarkdown(
 		lines.push(
 			`Verdicts: local=${details.localVerdict ?? "pending"} · frontier=${details.frontierVerdict ?? "pending"}`,
 		);
+	}
+	if (details.convergence) {
+		const repeat =
+			details.repeatedNonProgress && details.repeatedNonProgress >= 2
+				? ` (no progress x${details.repeatedNonProgress})`
+				: "";
+		lines.push(`Convergence: ${details.convergence}${repeat}`);
+		if (
+			details.convergence === "stalled" ||
+			details.convergence === "blocked-no-tests"
+		) {
+			lines.push(`  → ${truncateMiddle(convergenceDirective(details.convergence), 200)}`);
+		}
 	}
 	const routing = hybridTokenRouting(details);
 	const localTokens = routing.localInput + routing.localOutput;
@@ -6811,6 +6953,7 @@ async function runLocalLoop(
 	let testPassed = false;
 	for (let i = 1; i <= loops; i++) {
 		const iterationLabel = label ? `${label}.${i}` : `${i}`;
+		const signatureBefore = workspaceSignature(cwd, config);
 		notify?.(`Hybrid loop ${iterationLabel}: local worker running...`, "info");
 		const result = await runPiOnce({
 			cwd,
@@ -6925,6 +7068,16 @@ async function runLocalLoop(
 		if (progress.frontierRecheckTriggers.some((trigger) => trigger.active))
 			break;
 		if (testPassed) break;
+		// If the writer changed nothing this iteration, repeating it with the same
+		// context will not help. Break early instead of burning the remaining loops on
+		// no-op iterations (the DEBUG-1.2..4 "No changes made" failure mode).
+		if (i < loops && workspaceSignature(cwd, config) === signatureBefore) {
+			const noopNote = `Writer made no workspace changes in iteration ${iterationLabel}; ending the local loop early instead of repeating no-op iterations.`;
+			notify?.(noopNote, "warning");
+			logParts.push("", `> ${noopNote}`, "");
+			writeArtifact(cwd, config, state, "local-log.md", logParts.join("\n"));
+			break;
+		}
 	}
 	writeArtifact(cwd, config, state, "local-log.md", logParts.join("\n"));
 	writeArtifact(
@@ -7091,6 +7244,33 @@ function canonicalTaskTrackingMarkdown(cwd: string): string {
 		);
 	}
 	return lines.join("\n");
+}
+
+// True when canonical specs/**/tasks.md exists with at least one unchecked required
+// task ID. Used to warn the orchestrator that the task tracker is not yet complete.
+function hasUncheckedCanonicalTasks(cwd: string): boolean {
+	const specsDir = path.join(cwd, "specs");
+	if (!fs.existsSync(specsDir)) return false;
+	let unchecked = false;
+	const visit = (dir: string): void => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			if (unchecked) return;
+			if (entry.isSymbolicLink()) continue;
+			const fullPath = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				visit(fullPath);
+			} else if (entry.isFile() && entry.name === "tasks.md") {
+				const text = fs.readFileSync(fullPath, "utf8");
+				if (/^\s*-\s*\[ \]\s+T\d+\b/m.test(text)) unchecked = true;
+			}
+		}
+	};
+	try {
+		visit(specsDir);
+	} catch {
+		return false;
+	}
+	return unchecked;
 }
 
 async function runFrontierFinal(
@@ -7689,6 +7869,106 @@ async function runHandoffOrchestration(options: {
 	}
 }
 
+// Whether the workspace has any deterministic behavioral test available (configured
+// testCommand, configured verification command, or an inferred runtime test), as
+// opposed to smoke-only checks (typecheck/build/lint).
+function hasBehavioralTestCommand(cwd: string, config: HarnessConfig): boolean {
+	if (config.testCommand?.trim()) return true;
+	if (config.verificationCommands.length)
+		return config.verificationCommands.some(isBehavioralTestCommand);
+	return inferVerificationCommands(cwd).some(isBehavioralTestCommand);
+}
+
+interface ReviewBlockers {
+	highRiskResidualBlockers: string[];
+	blockingIssues: string[];
+	missingEvidence: string[];
+	nextAction?: string;
+}
+
+// Pull the structured blockers out of a review's JSON so they can be surfaced in
+// run-summary.md, where the parent orchestrator cannot miss them.
+function extractReviewBlockers(reviewText: string): ReviewBlockers {
+	const json = extractJsonObject<{
+		highRiskResidualBlockers?: unknown;
+		blockingIssues?: unknown;
+		missingEvidence?: unknown;
+		nextAction?: unknown;
+	}>(reviewText);
+	return {
+		highRiskResidualBlockers: normalizeStringArray(json?.highRiskResidualBlockers),
+		blockingIssues: normalizeStringArray(json?.blockingIssues),
+		missingEvidence: normalizeStringArray(json?.missingEvidence),
+		nextAction:
+			typeof json?.nextAction === "string" && json.nextAction.trim()
+				? json.nextAction.trim()
+				: undefined,
+	};
+}
+
+// Builds the "## Orchestrator directives" block appended to run-summary.md. This is
+// the machine-actionable guidance the parent reads first: convergence state, the one
+// directive to follow, the blockers to target, and any setup gaps (no tests, generic
+// progress) that would otherwise make the loop spin without converging.
+function orchestratorDirectivesMarkdown(input: {
+	convergence: Convergence;
+	verdict: string;
+	workspaceChanged: boolean;
+	interactivePolicyActive: boolean;
+	hasDeterministicTest: boolean;
+	fallbackProgress: boolean;
+	uncheckedCanonicalTasks: boolean;
+	repeatedNonProgressCount: number;
+	blockers: ReviewBlockers;
+}): string {
+	const lines = [
+		"## Orchestrator directives",
+		"",
+		`- convergence: ${input.convergence}`,
+		`- workspaceChanged: ${input.workspaceChanged}`,
+		`- interactiveRuntimePolicy: ${input.interactivePolicyActive ? "active" : "inactive"}`,
+		`- deterministicBehavioralTest: ${input.hasDeterministicTest ? "present" : "MISSING"}`,
+		`- repeatedNonProgressPackages: ${input.repeatedNonProgressCount}`,
+		"",
+		`Directive: ${convergenceDirective(input.convergence)}`,
+	];
+	if (input.repeatedNonProgressCount >= 2) {
+		lines.push(
+			"",
+			`WARNING: ${input.repeatedNonProgressCount} consecutive packages made no real progress. Stop repeating packages — change strategy or escalate to the user.`,
+		);
+	}
+	if (input.fallbackProgress) {
+		lines.push(
+			"",
+			"SETUP GAP: progress.json is still the generic single-slice fallback. Decompose spec-kit tasks.md into real slices and acceptance criteria in progress.json, and keep tasks.md checkboxes in sync.",
+		);
+	}
+	if (input.uncheckedCanonicalTasks) {
+		lines.push(
+			"",
+			"NOTE: canonical specs/**/tasks.md has unchecked required tasks. Completion claims must reconcile against that tracker.",
+		);
+	}
+	const blockerLines: string[] = [];
+	for (const b of input.blockers.highRiskResidualBlockers)
+		blockerLines.push(`- [high-risk] ${b}`);
+	for (const b of input.blockers.blockingIssues) blockerLines.push(`- [blocking] ${b}`);
+	for (const b of input.blockers.missingEvidence)
+		blockerLines.push(`- [missing-evidence] ${b}`);
+	if (blockerLines.length) {
+		lines.push(
+			"",
+			"Target these review findings in the next package (highest risk first):",
+			...blockerLines,
+		);
+	}
+	if (input.blockers.nextAction) {
+		lines.push("", `Reviewer next action: ${input.blockers.nextAction}`);
+	}
+	return lines.join("\n");
+}
+
 async function runHybridExecutionPackage(options: {
 	cwd: string;
 	ctx?: any;
@@ -7764,6 +8044,7 @@ async function runHybridExecutionPackage(options: {
 	(liveLog as any).onEvent = (label: string, event: any) => reporter.childEvent(label, event);
 	(liveLog as any).signal = options.signal ?? options.ctx?.signal;
 	reporter.setProgress(readProgress(options.cwd, config, task));
+	const packageSignatureBefore = workspaceSignature(options.cwd, config);
 	try {
 		reporter.stage("local-loop", "running", `parent package ${packageId}`);
 		const testPassed = await runLocalLoop(
@@ -7795,6 +8076,54 @@ async function runHybridExecutionPackage(options: {
 		);
 		details.localVerdict = review.verdict;
 		reporter.stage("local-review", review.verdict === "FAIL" ? "failed" : "done", localReviewSummary(review.verdict, readArtifact(options.cwd, config, "local-review.md")));
+
+		// Convergence assessment: turn this package's outcome into a machine-actionable
+		// signal so the parent cannot silently spin on no-progress packages.
+		const workspaceChanged =
+			workspaceSignature(options.cwd, config) !== packageSignatureBefore;
+		const interactivePolicyActive = interactiveRuntimePolicyApplies(
+			options.cwd,
+			config,
+			task,
+		);
+		const hasDeterministicTest = hasBehavioralTestCommand(options.cwd, config);
+		const convergence = assessConvergence({
+			verdict: review.verdict,
+			verificationPassed: deterministicVerificationPassed(
+				options.cwd,
+				config,
+				finish.progress,
+			),
+			workspaceChanged,
+			interactivePolicyActive,
+			hasDeterministicTest,
+		});
+		const nonProgress = convergence === "stalled" || convergence === "blocked-no-tests";
+		const repeatedNonProgressCount = nonProgress
+			? (runState.repeatedNonProgressCount ?? 0) + 1
+			: 0;
+		runState.lastPackageId = packageId;
+		runState.lastPackageVerdict = review.verdict;
+		runState.lastPackageConvergence = convergence;
+		runState.repeatedNonProgressCount = repeatedNonProgressCount;
+		saveHybridRunState(options.cwd, config, state, runState);
+		details.convergence = convergence;
+		details.repeatedNonProgress = repeatedNonProgressCount;
+
+		const directives = orchestratorDirectivesMarkdown({
+			convergence,
+			verdict: review.verdict,
+			workspaceChanged,
+			interactivePolicyActive,
+			hasDeterministicTest,
+			fallbackProgress: isFallbackProgress(finish.progress),
+			uncheckedCanonicalTasks: hasUncheckedCanonicalTasks(options.cwd),
+			repeatedNonProgressCount,
+			blockers: extractReviewBlockers(
+				readArtifact(options.cwd, config, "local-review.md"),
+			),
+		});
+
 		writeArtifact(options.cwd, config, state, "usage-summary.md", usageSummaryMarkdown(options.cwd, config));
 		writeArtifact(
 			options.cwd,
@@ -7811,7 +8140,11 @@ async function runHybridExecutionPackage(options: {
 				`- verificationAllPassed: ${finish.summary.allPassed}`,
 				`- reviewer: ${config.localReviewerModel} (local)`,
 				`- localReviewVerdict: ${review.verdict}`,
+				`- convergence: ${convergence}`,
+				`- workspaceChanged: ${workspaceChanged}`,
 				`- finishedAt: ${nowIso()}`,
+				"",
+				directives,
 				"",
 				"The parent Pi orchestrator should inspect orchestrator-package.md, progress.json, local-log.md, test-evidence.md, git-summary.md, verification-summary.json, and local-review.md before deciding the next package.",
 				"Per-package review uses the local reviewer; deterministic verification runs every package. Reserve the frontier model for the final ship decision: run /hybrid-final once the whole feature is complete.",
@@ -7822,7 +8155,7 @@ async function runHybridExecutionPackage(options: {
 		details.finishedAt = nowIso();
 		details.usageSummary = usageSummaryMarkdown(options.cwd, config);
 		details.artifacts = { ...state.artifacts };
-		reporter.stage("summary", "done", `package ${packageId} artifacts ready for parent orchestrator`);
+		reporter.stage("summary", "done", `package ${packageId}: convergence=${convergence}${repeatedNonProgressCount >= 2 ? ` (no progress x${repeatedNonProgressCount})` : ""}`);
 		return details;
 	} catch (error) {
 		details.status = "failed";
@@ -9664,18 +9997,41 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 					: `local tool smoke: WARN exit=${toolSmoke.exitCode} tools=${toolSmoke.usage.toolCalls} text=${JSON.stringify(toolSmoke.text)} stderr=${truncateMiddle(toolSmoke.stderr, 1000)}`,
 			);
 
-			const report = [
+			const failedChecks = checks.filter((c) => /\bFAIL\b/.test(c));
+			const endpointTrouble = checks.some(
+				(c) => /local \/models: FAIL|local Pi smoke: FAIL/.test(c),
+			);
+			const reportLines = [
 				`# Hybrid Doctor`,
 				"",
 				...checks.map((c) => `- ${c}`),
-			].join("\n");
+			];
+			if (endpointTrouble) {
+				reportLines.push(
+					"",
+					"## How to fix",
+					"",
+					`The local model endpoint (\`${config.localBaseUrl}\`) is not reachable or did not respond. The packaged default points at the author's LAN — set your own:`,
+					"",
+					"1. Make sure your local llama.cpp / OpenAI-compatible server is running and reachable.",
+					"2. Point the harness at it (no need to edit shipped defaults):",
+					"   - Env: `export HYBRID_LOCAL_BASE_URL=http://<host>:<port>/v1` then `/reload`.",
+					`   - Or project config: add \`"localBaseUrl": "http://<host>:<port>/v1"\` to \`${config.stateDir}/config.json\` (\`/hybrid-config\`).`,
+					"3. Pick worker/reviewer/frontier models with `/hybrid-models`.",
+					"4. Re-run `/hybrid-doctor` to confirm.",
+				);
+			}
+			const report = reportLines.join("\n");
 			const state = loadState(ctx.cwd, config);
 			writeArtifact(ctx.cwd, config, state, "doctor.md", report);
 			saveState(ctx.cwd, config, state);
 			setStatusWidget(ctx, report);
+			if (ctx?.hasUI) await showReport("Hybrid Doctor", report, ctx);
 			ctx.ui.notify(
-				`Hybrid doctor complete. See ${config.stateDir}/doctor.md`,
-				smoke.ok ? "info" : "warning",
+				failedChecks.length
+					? `Hybrid doctor: ${failedChecks.length} check(s) failed${endpointTrouble ? " — see 'How to fix' in the report" : ""}. ${config.stateDir}/doctor.md`
+					: `Hybrid doctor: all checks passed. ${config.stateDir}/doctor.md`,
+				failedChecks.length ? "warning" : "info",
 			);
 		},
 	});

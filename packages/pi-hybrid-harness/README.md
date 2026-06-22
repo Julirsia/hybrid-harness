@@ -16,6 +16,18 @@ The goal is to spend frontier-model tokens on high-leverage design and quality g
 - Local reviewer: `local-qwen/qwen36-27b-mtp-q5kxl`
 - Frontier: `openai-codex/gpt-5.5` with `high` thinking
 
+The shipped local endpoint is the author's LAN. To point the harness at your own local server without editing defaults, set environment variables (they override the packaged defaults but a project `.pi-harness/config.json` still wins):
+
+```bash
+export HYBRID_LOCAL_BASE_URL=http://127.0.0.1:8080/v1
+export HYBRID_LOCAL_WORKER_MODEL=local-qwen/<your-model>
+export HYBRID_LOCAL_REVIEWER_MODEL=local-qwen/<your-model>
+export HYBRID_FRONTIER_MODEL=openai-codex/gpt-5.5
+# optional: HYBRID_LOCAL_PROVIDER
+```
+
+Run `/hybrid-doctor` to verify the endpoint; if it can't reach the local server it prints a "How to fix" section. Use `/hybrid-models` to pick models interactively.
+
 The extension dynamically registers a `local-qwen` provider from the llama.cpp `/v1/models` endpoint. It also registers a `hybrid_run` custom tool with compact/expanded Pi TUI rendering for live harness progress.
 
 ## Install / update
