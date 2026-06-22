@@ -215,6 +215,25 @@ test("spinner animates on a fixed time bucket, not per render (anti-flicker)", (
 	assert.doesNotMatch(resultBlock, /buildHybridRunComponent\([^)]*,\s*true\)/);
 });
 
+test("restored session: detached card label + monitor disk fallback", () => {
+	// the live card carries a staleNote through to the builder
+	assert.match(source, /staleNote\?: string/);
+	const containerBlock = between("function buildHybridRunContainer", "function hybridDetailsToMarkdown");
+	assert.match(containerBlock, /if \(staleNote\)/);
+	// HybridLiveMessageComponent labels a non-live (restored) card
+	const liveBlock = between("class HybridLiveMessageComponent", "function summaryValue");
+	assert.match(liveBlock, /completed\/detached · 이 세션의 라이브 아님/);
+	// /hybrid-monitor falls back to the on-disk last run when there is no live target
+	assert.match(source, /function hybridLastRunReportMarkdown/);
+	const reportBlock = between("function hybridLastRunReportMarkdown", "function localWorkerPrompt");
+	assert.match(reportBlock, /run-state\.json/);
+	assert.match(reportBlock, /run-summary\.md/);
+	assert.match(reportBlock, /last run \(from disk\)/);
+	const monitorOpen = between("async function openHybridMonitor", 'pi.on("tool_call"');
+	assert.match(monitorOpen, /hybridLastRunReportMarkdown\(ctx\.cwd, config\)/);
+	assert.match(monitorOpen, /showReport\("Hybrid Monitor \(last run\)"/);
+});
+
 test("progress reconciliation accepts completion aliases and rewrites canonical markdown", () => {
 	// Status normalizers now live in src/progress-status.ts (alias behavior such as
 	// "complete" -> done is covered by src-progress-status.test.ts); assert wiring here.

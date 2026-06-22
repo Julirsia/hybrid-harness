@@ -2841,6 +2841,68 @@ function setStatusWidget(ctx: any, markdown: string): void {
 	ctx.ui.setWidget?.("hybrid-harness", lines, { placement: "aboveEditor" });
 }
 
+// Static, on-disk view of the most recent run for /hybrid-monitor when no live run
+// exists in this process (e.g. after a Pi restart / session restore). The live
+// monitor follows in-memory state keyed by liveId, which is gone after restart; the
+// durable artifacts in .pi-harness/ are not, so surface those instead.
+function hybridLastRunReportMarkdown(
+	cwd: string,
+	config: HarnessConfig,
+): string | undefined {
+	const runState = readJsonFile<HybridRunState>(
+		artifactPath(cwd, config, "run-state.json"),
+	);
+	const runSummary = readArtifact(cwd, config, "run-summary.md").trim();
+	const finalReview = readArtifact(cwd, config, "final-review.md").trim();
+	const liveLog = readArtifact(cwd, config, "live-log.md").trim();
+	const localLog = readArtifact(cwd, config, "local-log.md").trim();
+	if (!runState && !runSummary && !liveLog && !localLog) return undefined;
+	const lines = [
+		"# Hybrid Monitor — last run (from disk)",
+		"",
+		"이 세션에는 라이브 런이 없습니다(재시작/복원). 라이브 모니터는 현재 프로세스의 메모리 상태만 따라가므로, 대신 `.pi-harness/`의 마지막 런 기록을 정적으로 표시합니다.",
+		"",
+	];
+	if (runState) {
+		lines.push(
+			"## Run state",
+			"",
+			`- task: ${runState.task}`,
+			`- status: ${runState.status}`,
+			`- convergence: ${runState.lastPackageConvergence ?? "n/a"}`,
+			`- last verdict: ${runState.lastPackageVerdict ?? "n/a"}`,
+			`- repeated no-progress: ${runState.repeatedNonProgressCount ?? 0}`,
+			`- writer session: ${runState.writerSessionId}`,
+			`- updated: ${runState.updatedAt}`,
+			"",
+		);
+	}
+	if (runSummary) {
+		lines.push("## run-summary.md", "", truncateMiddle(runSummary, 8000), "");
+	}
+	if (finalReview) {
+		lines.push(
+			"## final-review.md",
+			"",
+			truncateMiddle(finalReview, 4000),
+			"",
+		);
+	}
+	const logSource = liveLog || localLog;
+	if (logSource) {
+		const tail = logSource.split("\n").slice(-40).join("\n");
+		lines.push(
+			"## recent log (tail)",
+			"",
+			"```",
+			truncateMiddle(tail, 6000),
+			"```",
+			"",
+		);
+	}
+	return lines.join("\n");
+}
+
 function requireTask(args: string, state: HarnessState): string {
 	const task = args.trim() || state.task || "";
 	if (!task)
@@ -4287,6 +4349,7 @@ class HybridRunComponent implements Component {
 		private readonly expanded: boolean,
 		private readonly theme: any,
 		private readonly animate: boolean,
+		private readonly staleNote?: string,
 	) {}
 
 	invalidate(): void {}
@@ -4298,6 +4361,7 @@ class HybridRunComponent implements Component {
 			this.theme,
 			width,
 			this.animate,
+			this.staleNote,
 		).render(width);
 	}
 }
@@ -4305,14 +4369,16 @@ class HybridRunComponent implements Component {
 // animate=true only for a live, in-process running run (the live message card). A
 // static/historical card (tool result, restored card, finished run) must render
 // deterministically — no spinner, durations frozen — so it does not churn the
-// transcript on every repaint/keystroke.
+// transcript on every repaint/keystroke. staleNote, when set, adds a dim banner
+// (e.g. a card restored after a Pi restart is not live in this session).
 function buildHybridRunComponent(
 	details: HybridRunDetails,
 	expanded: boolean,
 	theme: any,
 	animate = false,
+	staleNote?: string,
 ): Component {
-	return new HybridRunComponent(details, expanded, theme, animate);
+	return new HybridRunComponent(details, expanded, theme, animate, staleNote);
 }
 
 function buildHybridRunContainer(
@@ -4321,6 +4387,7 @@ function buildHybridRunContainer(
 	theme: any,
 	renderWidth: number,
 	animate = false,
+	staleNote?: string,
 ): Component {
 	const w = Math.max(20, renderWidth - 4);
 	const fit = (text: string) => truncLine(text, w);
@@ -4355,6 +4422,9 @@ function buildHybridRunContainer(
 	c.addChild(
 		new Text(fit(`${headerGlyph} ${themeBold(theme, modeLabel)}${stats}`), 0, 0),
 	);
+	if (staleNote) {
+		c.addChild(new Text(fit(theme.fg("dim", staleNote)), 0, 0));
+	}
 	c.addChild(new Spacer(1));
 
 	for (const line of koreanHybridRunOverviewLines(details, theme, now)) {
@@ -5866,6 +5936,9 @@ class HybridLiveMessageComponent implements Component {
 				this.expanded,
 				this.theme,
 				live && details.status === "running",
+				live
+					? undefined
+					: "completed/detached · 이 세션의 라이브 아님 (기록은 .pi-harness/, /hybrid-monitor)",
 			);
 		}
 		return this.inner.render(width);
@@ -9629,7 +9702,19 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 
 		const targetLiveId = liveId ?? getLastHybridLiveId();
 		if (!targetLiveId) {
-			ctx?.ui?.notify?.("No hybrid run to monitor yet.", "warning");
+			// No live run in this process (fresh session, or restored after a Pi
+			// restart). Fall back to the last run's durable artifacts on disk.
+			const config = loadConfig(ctx.cwd);
+			const report = hybridLastRunReportMarkdown(ctx.cwd, config);
+			if (report) {
+				await showReport("Hybrid Monitor (last run)", report, ctx);
+				ctx?.ui?.notify?.(
+					"No live run in this session; showing the last run from .pi-harness/.",
+					"info",
+				);
+			} else {
+				ctx?.ui?.notify?.("No hybrid run to monitor yet.", "warning");
+			}
 			return;
 		}
 
