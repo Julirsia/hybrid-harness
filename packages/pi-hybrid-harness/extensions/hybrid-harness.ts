@@ -65,6 +65,10 @@ import {
 	isFallbackProgress,
 	type Convergence,
 } from "../src/orchestration-signals.ts";
+import {
+	EDITABLE_CONFIG_KEYS,
+	coerceConfigValue,
+} from "../src/config-set.ts";
 
 type HarnessPhase =
 	| "idle"
@@ -115,6 +119,12 @@ interface HarnessConfig {
 	 * but FAILS always fails the run regardless of this flag.
 	 */
 	requireIntegrationGate: boolean;
+	/**
+	 * When true, register an agent-callable `hybrid_final` tool so an autonomous parent
+	 * orchestrator can invoke the frontier final gate itself. Default false: the frontier
+	 * final gate is reached only via the `/hybrid-final` slash command (human-triggered).
+	 */
+	enableHybridFinalTool: boolean;
 }
 
 interface HarnessState {
@@ -448,6 +458,7 @@ const DEFAULT_CONFIG: HarnessConfig = {
 	allowManifestReviewWhenNoGit: true,
 	requireDeterministicTestsForInteractive: true,
 	requireIntegrationGate: false,
+	enableHybridFinalTool: false,
 };
 
 function nowIso(): string {
@@ -9883,6 +9894,122 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "hybrid_final",
+		label: "Hybrid Final Gate",
+		description:
+			"Run the frontier final gate over the accumulated artifacts (design, diff, evidence, reviews) and return APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER. Disabled unless enableHybridFinalTool is set.",
+		promptSnippet:
+			"Run the frontier final ship-decision gate over the current hybrid artifacts",
+		promptGuidelines: [
+			"Use hybrid_final only after all packages are complete and per-package verification is clean — this is the single frontier-model gate in parent-driven mode.",
+			"Do not call hybrid_final to review a single in-progress package; that is what the local per-package review already does.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				task: {
+					type: "string",
+					description: "Overall feature/task goal; optional if an active hybrid task exists",
+				},
+			},
+			required: [],
+			additionalProperties: false,
+		} as any,
+		async execute(
+			_toolCallId: string,
+			params: { task?: string },
+			signal: AbortSignal,
+			_onUpdate:
+				| ((result: AgentToolResult<HybridRunDetails>) => void)
+				| undefined,
+			ctx: any,
+		) {
+			const config = loadConfig(ctx.cwd);
+			if (!config.enableHybridFinalTool) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "hybrid_final is disabled. Enable it with `/hybrid-set enableHybridFinalTool true` (or set \"enableHybridFinalTool\": true in .pi-harness/config.json), then retry. Otherwise a human can run the /hybrid-final slash command.",
+						},
+					],
+					isError: true,
+				};
+			}
+			ensureStateDir(ctx.cwd, config);
+			const state = loadState(ctx.cwd, config);
+			const task = (params.task ?? state.task ?? readArtifact(ctx.cwd, config, "task.md").replace(/^# Task\s*/i, "").trim()).trim();
+			if (!task) {
+				return {
+					content: [{ type: "text", text: "hybrid_final requires an existing hybrid task (run hybrid_exec or /hybrid-run first)." }],
+					isError: true,
+				};
+			}
+			const notify: Notify = (message, type = "info") => ctx.ui?.notify?.(message, type);
+			const liveId = makeHybridLiveId();
+			setLastHybridLiveId(liveId);
+			const store = getHybridLiveStore();
+			const details = createHybridRunDetails(task, "default", config);
+			details.currentStage = "frontier-final";
+			details.stages = details.stages.filter((stage) => stage.id === "frontier-final" || stage.id === "finish" || stage.id === "summary");
+			store.set(liveId, { version: 1, details });
+			try {
+				finishHybridArtifacts(ctx.cwd, config, state, task, notify);
+				const final = await runFrontierFinal(
+					ctx.cwd,
+					config,
+					state,
+					notify,
+					(line) => {
+						const snap = store.get(liveId);
+						if (snap) {
+							snap.details.recentOutput.push(line);
+							store.set(liveId, { version: snap.version + 1, details: snap.details });
+							ctx.ui?.requestRender?.();
+						}
+					},
+				);
+				details.frontierVerdict = final.verdict;
+				details.status = final.verdict === "APPROVE" ? "done" : "failed";
+				details.finishedAt = nowIso();
+				details.usageSummary = usageSummaryMarkdown(ctx.cwd, config);
+				details.artifacts = { ...state.artifacts };
+				for (const stage of details.stages) {
+					if (stage.id === "frontier-final")
+						stage.status = final.verdict === "APPROVE" ? "done" : "failed";
+				}
+				store.set(liveId, { version: 99, details });
+				setStatusWidget(ctx, statusMarkdown(ctx.cwd, config, state));
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Frontier final gate: ${final.verdict}\n\n${truncateMiddle(readArtifact(ctx.cwd, config, "final-review.md"), 4000)}`,
+						},
+					],
+					details,
+					isError: final.verdict !== "APPROVE",
+				};
+			} catch (error) {
+				details.status = "failed";
+				details.error = String(error instanceof Error ? error.message : error);
+				return {
+					content: [{ type: "text", text: `hybrid_final failed: ${details.error}` }],
+					details,
+					isError: true,
+				};
+			}
+		},
+		renderResult(
+			result: AgentToolResult<HybridRunDetails>,
+			options: { expanded?: boolean; isPartial?: boolean },
+			theme: any,
+		) {
+			return renderHybridRunResult(result, options, theme);
+		},
+	});
+
 	pi.registerCommand("hybrid-monitor", {
 		description: "Toggle the live hybrid child-session output modal",
 		handler: async (_args, ctx) => openHybridMonitor(ctx),
@@ -10488,6 +10615,64 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				ctx,
 			);
 			ctx.ui.notify(`Hybrid config: ${configFile}`, "info");
+		},
+	});
+
+	pi.registerCommand("hybrid-set", {
+		description:
+			"Set a hybrid config value: /hybrid-set <key> <value>. No args lists editable keys and current values.",
+		handler: async (args, ctx) => {
+			const config = loadConfig(ctx.cwd);
+			const raw = (args ?? "").trim();
+			const editableKeys = Object.keys(EDITABLE_CONFIG_KEYS).sort();
+			if (!raw) {
+				const lines = [
+					"# Hybrid Settings",
+					"",
+					`Usage: \`/hybrid-set <key> <value>\` (writes \`${config.stateDir}/config.json\`).`,
+					"Array keys (protectedPaths, verificationCommands) are edited directly in config.json.",
+					"",
+					"| Key | Type | Current |",
+					"|-----|------|---------|",
+					...editableKeys.map((key) => {
+						const value = (config as unknown as Record<string, unknown>)[key];
+						const shown = value === undefined || value === "" ? "(unset)" : String(value);
+						return `| \`${key}\` | ${EDITABLE_CONFIG_KEYS[key]} | ${shown} |`;
+					}),
+				].join("\n");
+				await showReport("Hybrid Settings", lines, ctx);
+				ctx.ui.notify("Hybrid settings listed. Use /hybrid-set <key> <value> to change one.", "info");
+				return;
+			}
+			const spaceIdx = raw.search(/\s/);
+			const key = spaceIdx === -1 ? raw : raw.slice(0, spaceIdx);
+			const valueRaw = spaceIdx === -1 ? "" : raw.slice(spaceIdx + 1);
+			const type = EDITABLE_CONFIG_KEYS[key];
+			if (!type) {
+				ctx.ui.notify(
+					`Unknown or non-editable key "${key}". Run /hybrid-set with no args to list editable keys.`,
+					"error",
+				);
+				return;
+			}
+			if (spaceIdx === -1) {
+				ctx.ui.notify(`Usage: /hybrid-set ${key} <value> (${type}).`, "warning");
+				return;
+			}
+			const coerced = coerceConfigValue(type, valueRaw);
+			if (!coerced.ok) {
+				ctx.ui.notify(`Cannot set ${key}: ${coerced.error}.`, "error");
+				return;
+			}
+			const configFile = updateConfigFile(ctx.cwd, config, {
+				[key]: coerced.value,
+			} as Partial<HarnessConfig>);
+			const updated = loadState(ctx.cwd, config);
+			setStatusWidget(ctx, statusMarkdown(ctx.cwd, loadConfig(ctx.cwd), updated));
+			ctx.ui.notify(
+				`Set ${key} = ${String(coerced.value)} in ${path.relative(ctx.cwd, configFile) || configFile}.`,
+				"info",
+			);
 		},
 	});
 

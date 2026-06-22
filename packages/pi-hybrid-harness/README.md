@@ -87,6 +87,7 @@ hybrid_exec tool       # parent Pi orchestrator executes one spec-kit/task batch
 /hybrid-grill <plan-or-design> # frontier-owned design stress test; writes design-grill.md
 /hybrid-doctor          # endpoint, pi subprocess, git, and local model smoke check
 /hybrid-config          # create/show .pi-harness/config.json
+/hybrid-set <key> <value> # set a scalar config value; no args lists editable keys + current values
 /hybrid-models          # pick worker/reviewer/frontier models from Pi's available models
 /hybrid-install-companions # install pi-show-diffs + pi-subagents, remove legacy pi-subagentura if present
 /hybrid-progress        # show slice, acceptance criteria, trigger, and test progress
@@ -193,6 +194,7 @@ Create `.pi-harness/config.json`:
   "maxReviewRepairCycles": 2,
   "maxFrontierPasses": 2,
   "requireDeterministicTestsForInteractive": true,
+  "enableHybridFinalTool": false,
   "enableSafetyGuards": true,
   "allowDestructiveBash": false,
   "protectedPaths": [".env", ".env.*", "**/.env", "**/.env.*", ".git/**", "**/*secret*", "**/*credential*", "**/*token*"],
@@ -207,6 +209,12 @@ Create `.pi-harness/config.json`:
   "localReviewerModel": "local-qwen/qwen36-27b-mtp-q5kxl"
 }
 ```
+
+Adjust any scalar value at runtime with `/hybrid-set <key> <value>` (run it with no args to list editable keys and current values). Array keys (`protectedPaths`, `verificationCommands`) are edited directly in `config.json`.
+
+### Optional `hybrid_final` tool
+
+By default the frontier final gate is reached only via the human-triggered `/hybrid-final` slash command. Set `enableHybridFinalTool: true` (or `/hybrid-set enableHybridFinalTool true`) to also register an agent-callable `hybrid_final` tool, so a fully autonomous parent orchestrator can run the single frontier ship-decision gate itself after all packages are complete. While disabled, the tool refuses to run and points back to `/hybrid-set`.
 
 ## Validation hardening
 

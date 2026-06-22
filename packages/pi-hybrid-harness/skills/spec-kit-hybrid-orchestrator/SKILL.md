@@ -13,7 +13,7 @@ Use this skill after spec-kit has produced implementation-ready `spec.md`, `plan
 - `hybrid_exec` tool: execution runtime. It receives one concrete `executionPackage`, runs the persistent single-writer implementation loop, runs deterministic verification (test/lint/build commands), runs a local-reviewer implementation review, and returns artifact references. It does not loop on review failure and does not call the frontier model — the parent drives the loop.
 - Hybrid writer session: persistent single writer. It implements/repairs/debugs across packages without losing context.
 - Per-package review is fresh/read-only and runs on the **local** `localReviewerModel`; do not rely on writer self-approval. Frontier tokens are reserved for the single final ship decision.
-- Final gate: run `/hybrid-final` once, after all packages are complete and verification is clean. This is the only step that spends the frontier model in this mode.
+- Final gate: run `/hybrid-final` once, after all packages are complete and verification is clean. This is the only step that spends the frontier model in this mode. (For fully autonomous orchestration, set `enableHybridFinalTool: true` via `/hybrid-set` to expose an agent-callable `hybrid_final` tool that runs the same gate.)
 
 ## Before implementation (setup gates)
 
@@ -39,7 +39,7 @@ Do these once, before the first implementation package. Skipping them is the mos
    - **`stalled`** (writer made no changes, review not passing) → do **not** resend the same package. Change strategy: target the exact blockers, split the batch smaller, or escalate. If `repeatedNonProgressPackages >= 2`, escalate to the user instead of retrying.
    - Always escalate/ask the user if requirements/design conflict, or public API/schema/security/data decisions changed.
 6. Repeat until all spec-kit `tasks.md` items are checked, `convergence` is `complete`, and verification is clean.
-7. Run `/hybrid-final` once for the frontier ship decision (APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER). This is the only frontier-model gate in this mode; per-package reviews were local.
+7. Run `/hybrid-final` once for the frontier ship decision (APPROVE / REQUEST_CHANGES / ESCALATE_TO_USER) — or call the `hybrid_final` tool if `enableHybridFinalTool` is on. This is the only frontier-model gate in this mode; per-package reviews were local.
 
 ## Execution package template
 

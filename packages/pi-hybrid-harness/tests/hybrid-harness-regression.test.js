@@ -315,6 +315,29 @@ test("onboarding: endpoint env override and doctor remediation (UX)", () => {
 	assert.match(doctorBlock, /failedChecks/);
 });
 
+test("hybrid_final tool is config-gated by enableHybridFinalTool", () => {
+	assert.match(source, /enableHybridFinalTool: boolean;/);
+	assert.match(source, /enableHybridFinalTool: false,/);
+	const toolBlock = between('name: "hybrid_final"', 'pi.registerCommand("hybrid-monitor"');
+	// gate: refuses to run when the flag is off, and points at /hybrid-set
+	assert.match(toolBlock, /if \(!config\.enableHybridFinalTool\)/);
+	assert.match(toolBlock, /\/hybrid-set enableHybridFinalTool true/);
+	// when enabled it runs the frontier final gate
+	assert.match(toolBlock, /runFrontierFinal\(/);
+	assert.match(toolBlock, /details\.frontierVerdict = final\.verdict/);
+});
+
+test("/hybrid-set edits scalar config keys with validation", () => {
+	const setBlock = between('pi.registerCommand("hybrid-set"', 'pi.registerCommand("hybrid-models"');
+	assert.match(setBlock, /EDITABLE_CONFIG_KEYS\[key\]/);
+	assert.match(setBlock, /coerceConfigValue\(type, valueRaw\)/);
+	assert.match(setBlock, /updateConfigFile\(ctx\.cwd, config/);
+	// no-arg path lists editable keys
+	assert.match(setBlock, /Object\.keys\(EDITABLE_CONFIG_KEYS\)/);
+	// unknown key is rejected
+	assert.match(setBlock, /Unknown or non-editable key/);
+});
+
 test("handoff completion requires an approving frontier final gate", () => {
 	const block = between("async function runHandoffOrchestration", "async function runHybridOrchestration");
 	assert.match(block, /id: "handoff-verification"/);
