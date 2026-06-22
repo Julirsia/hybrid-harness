@@ -4,6 +4,7 @@ import {
 	EDITABLE_CONFIG_KEYS,
 	THINKING_LEVELS,
 	coerceConfigValue,
+	validateConfigValue,
 } from "../src/config-set.ts";
 
 test("coerceConfigValue parses boolean aliases", () => {
@@ -46,4 +47,27 @@ test("EDITABLE_CONFIG_KEYS covers the toggles the slash command must expose", ()
 	// array keys are intentionally not editable via the slash command
 	assert.equal(EDITABLE_CONFIG_KEYS.protectedPaths, undefined);
 	assert.equal(EDITABLE_CONFIG_KEYS.verificationCommands, undefined);
+});
+
+test("validateConfigValue enforces operational numeric ranges", () => {
+	assert.deepEqual(validateConfigValue("maxFrontierPasses", 2), {
+		ok: true,
+		value: 2,
+	});
+	assert.equal(validateConfigValue("maxFrontierPasses", 0).ok, false);
+	assert.equal(validateConfigValue("maxLocalLoops", 1.5).ok, false);
+	assert.equal(validateConfigValue("liveLogMaxWidgetLines", -1).ok, false);
+	assert.equal(validateConfigValue("frontierInputCostPerMTok", -0.01).ok, false);
+	assert.deepEqual(validateConfigValue("frontierOutputCostPerMTok", 0), {
+		ok: true,
+		value: 0,
+	});
+});
+
+test("validateConfigValue rejects an empty stateDir", () => {
+	assert.equal(validateConfigValue("stateDir", "").ok, false);
+	assert.deepEqual(validateConfigValue("stateDir", ".custom-state"), {
+		ok: true,
+		value: ".custom-state",
+	});
 });

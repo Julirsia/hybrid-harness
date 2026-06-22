@@ -48,6 +48,19 @@ export type CoerceResult =
 	| { ok: true; value: boolean | number | string }
 	| { ok: false; error: string };
 
+const POSITIVE_INTEGER_KEYS = new Set([
+	"maxLocalLoops",
+	"maxReviewRepairCycles",
+	"maxFrontierPasses",
+	"maxDiffCharsBeforeFrontier",
+	"liveLogMaxWidgetLines",
+]);
+
+const NON_NEGATIVE_NUMBER_KEYS = new Set([
+	"frontierInputCostPerMTok",
+	"frontierOutputCostPerMTok",
+]);
+
 export function coerceConfigValue(type: ConfigValueType, raw: string): CoerceResult {
 	const trimmed = raw.trim();
 	switch (type) {
@@ -75,4 +88,24 @@ export function coerceConfigValue(type: ConfigValueType, raw: string): CoerceRes
 		case "string":
 			return { ok: true, value: trimmed };
 	}
+}
+
+export function validateConfigValue(
+	key: string,
+	value: boolean | number | string,
+): CoerceResult {
+	if (POSITIVE_INTEGER_KEYS.has(key)) {
+		if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+			return { ok: false, error: "expected a positive integer" };
+		}
+	}
+	if (NON_NEGATIVE_NUMBER_KEYS.has(key)) {
+		if (typeof value !== "number" || value < 0) {
+			return { ok: false, error: "expected a non-negative number" };
+		}
+	}
+	if (key === "stateDir" && (typeof value !== "string" || !value.trim())) {
+		return { ok: false, error: "stateDir cannot be empty" };
+	}
+	return { ok: true, value };
 }

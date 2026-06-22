@@ -68,6 +68,7 @@ import {
 import {
 	EDITABLE_CONFIG_KEYS,
 	coerceConfigValue,
+	validateConfigValue,
 } from "../src/config-set.ts";
 
 type HarnessPhase =
@@ -494,11 +495,13 @@ function writeJsonFile(filePath: string, value: unknown): void {
 
 function updateConfigFile(
 	cwd: string,
-	config: HarnessConfig,
+	_config: HarnessConfig,
 	updates: Partial<HarnessConfig>,
 ): string {
-	ensureStateDir(cwd, config);
-	const configFile = artifactPath(cwd, config, "config.json");
+	// Config is the bootstrap that selects stateDir, so its own location must not
+	// move with stateDir. Otherwise the first stateDir edit makes later settings
+	// write to a file loadConfig never reads.
+	const configFile = path.join(cwd, DEFAULT_CONFIG.stateDir, "config.json");
 	const existing = readJsonFile<Partial<HarnessConfig>>(configFile) ?? {};
 	writeJsonFile(configFile, { ...existing, ...updates });
 	return configFile;
@@ -1571,6 +1574,16 @@ function verificationCommands(cwd: string, config: HarnessConfig): string[] {
 	return inferVerificationCommands(cwd);
 }
 
+function isPlaceholderVerificationContract(value: string | undefined): boolean {
+	return !value || /define a reproducible command|no executable verification contract/i.test(value);
+}
+
+function evidenceTypeForCommand(command: string): EvidenceType {
+	if (/playwright|cypress|\be2e\b/i.test(command)) return "e2e";
+	if (/test|vitest|jest|mocha|spec/i.test(command)) return "unit";
+	return "smoke";
+}
+
 function claimEvidenceRows(
 	progress: HarnessProgress,
 	summary: VerificationSummary,
@@ -1579,12 +1592,17 @@ function claimEvidenceRows(
 		.filter((command) => command.ok)
 		.map((command) => command.command);
 	return progress.acceptanceCriteria.map((criterion) => {
+		const explicitContract = criterion.verificationContracts?.find(
+			(contract) => !isPlaceholderVerificationContract(contract),
+		);
 		const evidenceCommand =
-			criterion.verificationContracts?.[0] ??
+			explicitContract ??
 			passedCommands[0] ??
 			"No executable verification contract recorded";
 		const evidenceType =
-			criterion.evidenceType ??
+			(!explicitContract && passedCommands[0]
+				? evidenceTypeForCommand(passedCommands[0])
+				: criterion.evidenceType) ??
 			(criterion.runtimeEvidence?.length ? "integration" : "static");
 		const residualGap =
 			criterion.residualGaps?.join("; ") ||
@@ -6530,6 +6548,27 @@ function reconcileHybridCompletion(
 		summary.allPassed ||
 		hasPassingConfiguredTest(progress) ||
 		(!interactivePolicy && summary.commands.length === 0);
+	const passedBehavioralCommand = summary.commands.find(
+		(command) => command.ok && isBehavioralTestCommand(command.command),
+	)?.command;
+	if (passedBehavioralCommand) {
+		progress.acceptanceCriteria = progress.acceptanceCriteria.map((criterion) => {
+			const contracts = criterion.verificationContracts ?? [];
+			if (contracts.length > 0 && !contracts.every(isPlaceholderVerificationContract))
+				return criterion;
+			const runtimeEvidence = `${passedBehavioralCommand}: passed deterministic verification.`;
+			return {
+				...criterion,
+				verificationContracts: [passedBehavioralCommand],
+				evidenceType: evidenceTypeForCommand(passedBehavioralCommand),
+				runtimeEvidence: uniqueStrings([
+					...(criterion.runtimeEvidence ?? []),
+					runtimeEvidence,
+				]),
+				residualGaps: [],
+			};
+		});
+	}
 	progress.testObservations = [
 		...progress.testObservations.filter((test) => test.iteration !== "finish"),
 		...summary.commands.map((test) => ({
@@ -7293,6 +7332,7 @@ async function runFrontierFinal(
 	state: HarnessState,
 	notify?: Notify,
 	liveLog?: LiveLog,
+	signal?: AbortSignal,
 ): Promise<{
 	verdict: ReturnType<typeof parseFrontierVerdict>;
 	result: PiRunResult;
@@ -7378,6 +7418,7 @@ async function runFrontierFinal(
 		liveLabel: "frontier-final",
 		rawEventPath: artifactPath(cwd, config, "events.jsonl"),
 		onLog: liveLog,
+		signal,
 	});
 	const policyOverride =
 		interactivePolicy && !deterministicVerificationPassed(cwd, config, progress)
@@ -8125,6 +8166,14 @@ async function runHybridExecutionPackage(options: {
 		runState.lastPackageVerdict = review.verdict;
 		runState.lastPackageConvergence = convergence;
 		runState.repeatedNonProgressCount = repeatedNonProgressCount;
+		// The package execution itself is finished even when convergence asks the
+		// parent for a repair or escalation. Do not leave durable state looking active.
+		runState.status = "done";
+		runState.currentStage = "summary";
+		runState.lastCompletedStage = "summary";
+		runState.completedStages[
+			hybridRunStageKey("summary", runState.frontierPass, runState.repairCycle)
+		] = nowIso();
 		saveHybridRunState(options.cwd, config, state, runState);
 		details.convergence = convergence;
 		details.repeatedNonProgress = repeatedNonProgressCount;
@@ -8155,7 +8204,7 @@ async function runHybridExecutionPackage(options: {
 				`- packageId: ${packageId}`,
 				`- task: ${task}`,
 				`- writerSessionId: ${runState.writerSessionId}`,
-				`- configuredTestsPassed: ${testPassed}`,
+				`- configuredTestsPassed: ${config.testCommand ? String(testPassed) : "not configured (see deterministic verification)"}`,
 				`- verificationAllPassed: ${finish.summary.allPassed}`,
 				`- reviewer: ${config.localReviewerModel} (local)`,
 				`- localReviewVerdict: ${review.verdict}`,
@@ -9939,12 +9988,30 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			}
 			ensureStateDir(ctx.cwd, config);
 			const state = loadState(ctx.cwd, config);
-			const task = (params.task ?? state.task ?? readArtifact(ctx.cwd, config, "task.md").replace(/^# Task\s*/i, "").trim()).trim();
+			const requestedTask = params.task?.trim();
+			const activeTask = (
+				state.task ??
+				readArtifact(ctx.cwd, config, "task.md").replace(/^# Task\s*/i, "").trim()
+			).trim();
+			if (requestedTask && activeTask && requestedTask !== activeTask) {
+				return {
+					content: [{ type: "text", text: `hybrid_final task does not match the active hybrid task. Active: ${activeTask}` }],
+					isError: true,
+				};
+			}
+			const task = requestedTask || activeTask;
 			if (!task) {
 				return {
 					content: [{ type: "text", text: "hybrid_final requires an existing hybrid task (run hybrid_exec or /hybrid-run first)." }],
 					isError: true,
 				};
+			}
+			if (!state.task) {
+				state.task = task;
+				if (!readArtifact(ctx.cwd, config, "task.md").trim()) {
+					writeArtifact(ctx.cwd, config, state, "task.md", `# Task\n\n${task}\n`);
+				}
+				saveState(ctx.cwd, config, state);
 			}
 			const notify: Notify = (message, type = "info") => ctx.ui?.notify?.(message, type);
 			const liveId = makeHybridLiveId();
@@ -9969,6 +10036,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 							ctx.ui?.requestRender?.();
 						}
 					},
+					signal,
 				);
 				details.frontierVerdict = final.verdict;
 				details.status = final.verdict === "APPROVE" ? "done" : "failed";
@@ -10664,13 +10732,18 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 				ctx.ui.notify(`Cannot set ${key}: ${coerced.error}.`, "error");
 				return;
 			}
+			const validated = validateConfigValue(key, coerced.value);
+			if (!validated.ok) {
+				ctx.ui.notify(`Cannot set ${key}: ${validated.error}.`, "error");
+				return;
+			}
 			const configFile = updateConfigFile(ctx.cwd, config, {
-				[key]: coerced.value,
+				[key]: validated.value,
 			} as Partial<HarnessConfig>);
 			const updated = loadState(ctx.cwd, config);
 			setStatusWidget(ctx, statusMarkdown(ctx.cwd, loadConfig(ctx.cwd), updated));
 			ctx.ui.notify(
-				`Set ${key} = ${String(coerced.value)} in ${path.relative(ctx.cwd, configFile) || configFile}.`,
+				`Set ${key} = ${String(validated.value)} in ${path.relative(ctx.cwd, configFile) || configFile}.`,
 				"info",
 			);
 		},

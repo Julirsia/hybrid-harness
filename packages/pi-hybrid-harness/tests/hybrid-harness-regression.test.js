@@ -209,6 +209,9 @@ test("finishing step records structured verification summary and syncs state art
 	assert.match(source, /function syncHarnessArtifacts/);
 	assert.match(source, /"test-evidence.md"/);
 	assert.match(source, /state\.phase = "implemented"/);
+	assert.match(source, /isPlaceholderVerificationContract/);
+	assert.match(source, /passedBehavioralCommand/);
+	assert.match(source, /evidenceTypeForCommand\(passedBehavioralCommand\)/);
 });
 
 test("verification rejects false-green runtime output and includes lint", () => {
@@ -263,6 +266,9 @@ test("hybrid_exec surfaces convergence and orchestrator directives in run-summar
 	assert.match(execBlock, /orchestratorDirectivesMarkdown\(/);
 	assert.match(execBlock, /extractReviewBlockers\(/);
 	assert.match(execBlock, /repeatedNonProgressCount/);
+	assert.match(execBlock, /runState\.status = "done"/);
+	assert.match(execBlock, /runState\.currentStage = "summary"/);
+	assert.match(execBlock, /not configured \(see deterministic verification\)/);
 	assert.match(execBlock, /- convergence: \$\{convergence\}/);
 	// verification: ran commands must pass; no applicable commands only OK for non-interactive
 	assert.match(execBlock, /finish\.summary\.commands\.length > 0/);
@@ -325,17 +331,27 @@ test("hybrid_final tool is config-gated by enableHybridFinalTool", () => {
 	// when enabled it runs the frontier final gate
 	assert.match(toolBlock, /runFrontierFinal\(/);
 	assert.match(toolBlock, /details\.frontierVerdict = final\.verdict/);
+	assert.match(toolBlock, /requestedTask && activeTask && requestedTask !== activeTask/);
+	assert.match(toolBlock, /saveState\(ctx\.cwd, config, state\)/);
+	assert.match(toolBlock, /signal,/);
 });
 
 test("/hybrid-set edits scalar config keys with validation", () => {
 	const setBlock = between('pi.registerCommand("hybrid-set"', 'pi.registerCommand("hybrid-models"');
 	assert.match(setBlock, /EDITABLE_CONFIG_KEYS\[key\]/);
 	assert.match(setBlock, /coerceConfigValue\(type, valueRaw\)/);
+	assert.match(setBlock, /validateConfigValue\(key, coerced\.value\)/);
 	assert.match(setBlock, /updateConfigFile\(ctx\.cwd, config/);
 	// no-arg path lists editable keys
 	assert.match(setBlock, /Object\.keys\(EDITABLE_CONFIG_KEYS\)/);
 	// unknown key is rejected
 	assert.match(setBlock, /Unknown or non-editable key/);
+});
+
+test("config writes stay in the bootstrap directory when stateDir changes", () => {
+	const block = between("function updateConfigFile", "function loadConfig");
+	assert.match(block, /path\.join\(cwd, DEFAULT_CONFIG\.stateDir, "config\.json"\)/);
+	assert.doesNotMatch(block, /artifactPath\(cwd, config, "config\.json"\)/);
 });
 
 test("handoff completion requires an approving frontier final gate", () => {

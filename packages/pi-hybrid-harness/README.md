@@ -211,6 +211,7 @@ Create `.pi-harness/config.json`:
 ```
 
 Adjust any scalar value at runtime with `/hybrid-set <key> <value>` (run it with no args to list editable keys and current values). Array keys (`protectedPaths`, `verificationCommands`) are edited directly in `config.json`.
+The bootstrap config always remains at `.pi-harness/config.json`; changing `stateDir` relocates run artifacts, not the config file that selects their location.
 
 ### Optional `hybrid_final` tool
 
