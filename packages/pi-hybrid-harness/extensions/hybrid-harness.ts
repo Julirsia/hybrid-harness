@@ -20,6 +20,43 @@ import {
 	type SelectItem,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import type {
+	CriterionStatus,
+	EvidenceType,
+	SliceStatus,
+	TestFailureKind,
+} from "../src/types.ts";
+import {
+	estimateRoughTokenCount,
+	formatBytes,
+	inferContextWindow,
+	safeSessionIdPart,
+	stripAnsiCodes,
+	truncateMiddle,
+} from "../src/text.ts";
+import {
+	extractJsonObject,
+	isUsableChildResult,
+	parseFrontierVerdict,
+	parseLocalVerdict,
+} from "../src/verdicts.ts";
+import {
+	globToRegExp,
+	isDestructiveCommand,
+	isProtectedPath,
+	normalizeRelativePath,
+} from "../src/safety.ts";
+import {
+	classifyTestFailure,
+	fatalVerificationSignals,
+	verificationCommandPassed,
+} from "../src/verification.ts";
+import {
+	normalizeCriterionStatus,
+	normalizeEvidenceType,
+	normalizeSliceStatus,
+	normalizeStringArray,
+} from "../src/progress-status.ts";
 
 type HarnessPhase =
 	| "idle"
@@ -86,21 +123,7 @@ interface HarnessState {
 	artifacts: Record<string, string>;
 }
 
-type SliceStatus = "pending" | "in_progress" | "done" | "blocked";
-type CriterionStatus = "pending" | "satisfied" | "failed" | "unknown";
-type EvidenceType = "unit" | "integration" | "e2e" | "manual" | "static" | "smoke";
 type PlanReviewVerdict = "READY" | "NEEDS_REVISION" | "ESCALATE_TO_USER";
-type TestFailureKind =
-	| "none"
-	| "compile_error"
-	| "type_error"
-	| "lint_error"
-	| "unit_failure"
-	| "integration_failure"
-	| "timeout"
-	| "missing_dependency"
-	| "missing_test"
-	| "unknown";
 
 interface HarnessProgress {
 	version: 1;
@@ -411,14 +434,6 @@ const DEFAULT_CONFIG: HarnessConfig = {
 
 function nowIso(): string {
 	return new Date().toISOString();
-}
-
-function safeSessionIdPart(value: string): string {
-	return value
-		.toLowerCase()
-		.replace(/[^a-z0-9._-]+/g, "-")
-		.replace(/^-+|-+$/g, "")
-		.slice(0, 80) || "task";
 }
 
 function newHybridWriterSessionId(task: string): string {
@@ -1113,54 +1128,6 @@ function clearHybridStageFrom(
 	return [...new Set(removed)];
 }
 
-function normalizeRelativePath(cwd: string, candidate: string): string {
-	const absolute = path.isAbsolute(candidate)
-		? candidate
-		: path.resolve(cwd, candidate);
-	return path.relative(cwd, absolute).replace(/\\/g, "/");
-}
-
-function globToRegExp(glob: string): RegExp {
-	const escaped = glob
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replace(/\*\*/g, "::DOUBLE_STAR::")
-		.replace(/\*/g, "[^/]*")
-		.replace(/::DOUBLE_STAR::/g, ".*");
-	return new RegExp(`^${escaped}$`, "i");
-}
-
-function isProtectedPath(
-	cwd: string,
-	config: HarnessConfig,
-	candidate: string,
-): string | undefined {
-	const rel = normalizeRelativePath(cwd, candidate);
-	return config.protectedPaths.find(
-		(pattern) =>
-			globToRegExp(pattern).test(rel) ||
-			globToRegExp(pattern).test(path.basename(rel)),
-	);
-}
-
-function isDestructiveCommand(command: string): string | undefined {
-	const checks: Array<[RegExp, string]> = [
-		[
-			/\brm\s+(-[^\n]*[rf]|[^\n]*\s-r|[^\n]*\s-f)/i,
-			"rm with recursive/force flags",
-		],
-		[/\bsudo\b/i, "sudo"],
-		[/\bchmod\s+(-R\s+)?777\b/i, "chmod 777"],
-		[/\bchown\s+-R\b/i, "recursive chown"],
-		[
-			/\bgit\s+(reset\s+--hard|clean\s+-[fdx]+)/i,
-			"destructive git reset/clean",
-		],
-		[/\b(killall|pkill)\b/i, "process kill"],
-		[/>\s*\.(env|npmrc|pypirc)\b/i, "redirect into sensitive config"],
-	];
-	return checks.find(([regex]) => regex.test(command))?.[1];
-}
-
 const HYBRID_RUN_ARTIFACTS = [
 	"state.json",
 	"task.md",
@@ -1236,12 +1203,6 @@ function startNewHybridTask(
 	return { state, archive };
 }
 
-function truncateMiddle(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const half = Math.floor((maxChars - 120) / 2);
-	return `${text.slice(0, half)}\n\n[... ${text.length - maxChars} chars omitted ...]\n\n${text.slice(-half)}`;
-}
-
 function hybridRequirementsContext(
 	cwd: string,
 	config: HarnessConfig,
@@ -1259,89 +1220,6 @@ function hybridRequirementsContext(
 		truncateMiddle(requirements, maxChars),
 		"```",
 	];
-}
-
-function extractJsonObject<T>(text: string): T | undefined {
-	const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-	const candidates = fenced ? [fenced[1], text] : [text];
-	for (const candidate of candidates) {
-		try {
-			return JSON.parse(candidate.trim()) as T;
-		} catch {
-			// try brace extraction below
-		}
-		const start = candidate.indexOf("{");
-		const end = candidate.lastIndexOf("}");
-		if (start >= 0 && end > start) {
-			try {
-				return JSON.parse(candidate.slice(start, end + 1)) as T;
-			} catch {
-				// keep trying
-			}
-		}
-	}
-	return undefined;
-}
-
-function classifyTestFailure(
-	output: string,
-	ok: boolean,
-	code: number | null,
-): TestFailureKind {
-	if (ok) return "none";
-	const text = output.toLowerCase();
-	if (code === null || text.includes("timed out") || text.includes("timeout"))
-		return "timeout";
-	if (
-		text.includes("no configured deterministic test") ||
-		text.includes("no deterministic test") ||
-		text.includes("missing test command")
-	)
-		return "missing_test";
-	if (
-		text.includes("cannot find module") ||
-		text.includes("module not found") ||
-		text.includes("no such file or directory") ||
-		text.includes("command not found")
-	)
-		return "missing_dependency";
-	if (
-		text.includes("typescript") ||
-		text.includes("tsc") ||
-		text.includes("type error") ||
-		text.includes("is not assignable to") ||
-		(text.includes("property") && text.includes("does not exist"))
-	)
-		return "type_error";
-	if (
-		text.includes("syntaxerror") ||
-		text.includes("compile") ||
-		text.includes("compilation") ||
-		text.includes("build failed")
-	)
-		return "compile_error";
-	if (
-		text.includes("eslint") ||
-		text.includes("lint") ||
-		text.includes("prettier") ||
-		text.includes("format")
-	)
-		return "lint_error";
-	if (
-		text.includes("integration") ||
-		text.includes("e2e") ||
-		text.includes("playwright") ||
-		text.includes("cypress")
-	)
-		return "integration_failure";
-	if (
-		text.includes("test") ||
-		text.includes("expect") ||
-		text.includes("assert") ||
-		text.includes("failed")
-	)
-		return "unit_failure";
-	return "unknown";
 }
 
 function progressToMarkdown(progress: HarnessProgress): string {
@@ -1463,64 +1341,6 @@ function fallbackProgress(task: string): HarnessProgress {
 		blockers: [],
 		nextAction: "Implement S1 according to frontier-design.md.",
 	};
-}
-
-function normalizeSliceStatus(value: unknown): SliceStatus {
-	switch (String(value ?? "").toLowerCase().replace(/[-\s]+/g, "_")) {
-		case "done":
-		case "complete":
-		case "completed":
-		case "pass":
-		case "passed":
-		case "satisfied":
-			return "done";
-		case "in_progress":
-		case "running":
-		case "active":
-			return "in_progress";
-		case "blocked":
-		case "failed":
-			return "blocked";
-		default:
-			return "pending";
-	}
-}
-
-function normalizeCriterionStatus(value: unknown): CriterionStatus {
-	switch (String(value ?? "").toLowerCase().replace(/[-\s]+/g, "_")) {
-		case "satisfied":
-		case "done":
-		case "complete":
-		case "completed":
-		case "pass":
-		case "passed":
-			return "satisfied";
-		case "failed":
-		case "fail":
-			return "failed";
-		case "unknown":
-			return "unknown";
-		default:
-			return "pending";
-	}
-}
-
-function normalizeStringArray(value: unknown): string[] {
-	return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
-}
-
-function normalizeEvidenceType(value: unknown): EvidenceType | undefined {
-	const normalized = String(value ?? "").toLowerCase();
-	if (
-		normalized === "unit" ||
-		normalized === "integration" ||
-		normalized === "e2e" ||
-		normalized === "manual" ||
-		normalized === "static" ||
-		normalized === "smoke"
-	)
-		return normalized;
-	return undefined;
 }
 
 function normalizeProgress(
@@ -1663,33 +1483,6 @@ function runCommand(
 		ok: result.status === 0,
 		code: result.status,
 		output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
-	};
-}
-
-const FATAL_VERIFICATION_PATTERNS: Array<{
-	label: string;
-	pattern: RegExp;
-}> = [
-	{ label: "address already in use (EADDRINUSE)", pattern: /\bEADDRINUSE\b|address already in use/i },
-	{ label: "unhandled promise rejection", pattern: /UnhandledPromiseRejection/i },
-	{ label: "fatal runtime error", pattern: /^\s*(?:FATAL(?: ERROR)?|Fatal error:)\b/im },
-	{ label: "test timeout", pattern: /Test timeout of \d+ms exceeded/i },
-];
-
-function fatalVerificationSignals(output: string): string[] {
-	return FATAL_VERIFICATION_PATTERNS
-		.filter(({ pattern }) => pattern.test(output))
-		.map(({ label }) => label);
-}
-
-function verificationCommandPassed(
-	result: { ok: boolean; output: string; code: number | null },
-	expectedExit = 0,
-): { ok: boolean; fatalSignals: string[] } {
-	const fatalSignals = fatalVerificationSignals(result.output);
-	return {
-		ok: result.code === expectedExit && fatalSignals.length === 0,
-		fatalSignals,
 	};
 }
 
@@ -2121,10 +1914,6 @@ async function writeTempPrompt(
 		mode: 0o600,
 	});
 	return { dir, filePath };
-}
-
-function stripAnsiCodes(text: string): string {
-	return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
 function extractTextContent(result: any): string {
@@ -2654,16 +2443,6 @@ async function fetchLocalModels(
 	}
 }
 
-function inferContextWindow(model: {
-	id: string;
-	description?: string;
-}): number {
-	const text = `${model.id} ${model.description ?? ""}`.toLowerCase();
-	if (text.includes("200k")) return 200_000;
-	if (text.includes("131k")) return 131_000;
-	return 128_000;
-}
-
 function formatUsage(result: PiRunResult): string {
 	const u = result.usage;
 	const parts = [
@@ -2779,13 +2558,6 @@ function usageSummaryMarkdown(cwd: string, config: HarnessConfig): string {
 		"Note: estimated local tokens are rough counts from prompts, streamed assistant text, and in-memory tool outputs. Raw tool output is still not persisted.",
 	);
 	return lines.join("\n");
-}
-
-function formatBytes(bytes: number): string {
-	if (!Number.isFinite(bytes) || bytes < 0) return "unknown";
-	if (bytes < 1024) return `${bytes} B`;
-	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function findWriterSessionFiles(
@@ -3490,24 +3262,6 @@ function formatTokenCount(tokens: number): string {
 	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
 	if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
 	return String(tokens);
-}
-
-function estimateRoughTokenCount(text: string): number {
-	if (!text.trim()) return 0;
-	let asciiChars = 0;
-	let cjkChars = 0;
-	let otherChars = 0;
-	for (const ch of text) {
-		const cp = ch.codePointAt(0) ?? 0;
-		if (cp <= 0x7f) {
-			asciiChars++;
-		} else if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/u.test(ch)) {
-			cjkChars++;
-		} else {
-			otherChars++;
-		}
-	}
-	return Math.max(1, Math.ceil(asciiChars / 4) + cjkChars + otherChars * 2);
 }
 
 function formatApproxTokenCount(tokens: number, approximate: boolean): string {
@@ -5920,24 +5674,6 @@ class HybridLiveMessageComponent implements Component {
 	}
 }
 
-function parseLocalVerdict(
-	text: string,
-): "PASS" | "PASS_WITH_CONCERNS" | "FAIL" | "UNKNOWN" {
-	const json = extractJsonObject<{ verdict?: string }>(text);
-	const jsonVerdict = json?.verdict?.toUpperCase();
-	if (jsonVerdict === "PASS_WITH_CONCERNS") return "PASS_WITH_CONCERNS";
-	if (jsonVerdict === "PASS") return "PASS";
-	if (jsonVerdict === "FAIL") return "FAIL";
-	const normalized = text.toUpperCase();
-	const match = normalized.match(
-		/VERDICT\s*:?\s*(PASS_WITH_CONCERNS|PASS|FAIL)/,
-	);
-	if (match?.[1] === "PASS_WITH_CONCERNS") return "PASS_WITH_CONCERNS";
-	if (match?.[1] === "PASS") return "PASS";
-	if (match?.[1] === "FAIL") return "FAIL";
-	return "UNKNOWN";
-}
-
 function summaryValue(text: string | undefined, max = 140): string | undefined {
 	const normalized = text?.replace(/\s+/g, " ").replace(/;/g, ",").trim();
 	return normalized ? truncateMiddle(normalized, max) : undefined;
@@ -5987,24 +5723,6 @@ function localReviewSummary(
 	if (conciseReason) parts.push(`reason=${conciseReason}`);
 	if (conciseNext) parts.push(`next=${conciseNext}`);
 	return parts.join("; ");
-}
-
-function parseFrontierVerdict(
-	text: string,
-): "APPROVE" | "REQUEST_CHANGES" | "ESCALATE_TO_USER" | "UNKNOWN" {
-	const json = extractJsonObject<{ verdict?: string }>(text);
-	const jsonVerdict = json?.verdict?.toUpperCase();
-	if (jsonVerdict === "APPROVE") return "APPROVE";
-	if (jsonVerdict === "REQUEST_CHANGES") return "REQUEST_CHANGES";
-	if (jsonVerdict === "ESCALATE_TO_USER") return "ESCALATE_TO_USER";
-	const normalized = text.toUpperCase();
-	const match = normalized.match(
-		/VERDICT\s*:?\s*(APPROVE|REQUEST_CHANGES|ESCALATE_TO_USER)/,
-	);
-	if (match?.[1] === "APPROVE") return "APPROVE";
-	if (match?.[1] === "REQUEST_CHANGES") return "REQUEST_CHANGES";
-	if (match?.[1] === "ESCALATE_TO_USER") return "ESCALATE_TO_USER";
-	return "UNKNOWN";
 }
 
 function stringifyBriefItem(value: unknown): string {
@@ -6139,7 +5857,7 @@ async function showHybridClarificationGate(
 			tui: TUI,
 			theme: any,
 			_keybindings: unknown,
-			done: (result: HybridGateAction) => void,
+			done: (result?: HybridGateAction) => void,
 		) =>
 			new HybridReportOverlayComponent(
 				tui,
@@ -6991,6 +6709,15 @@ async function runHybridStart(
 	state.phase = "scouted";
 	saveState(cwd, config, state);
 
+	// A timed-out, crashed, stuck-loop-guarded, or empty scout run must not be silently
+	// captured as a usable repo map and fed to the architect. Fail the design stage so it
+	// is not marked complete and a later /hybrid-run resume re-runs it.
+	if (!isUsableChildResult(scout)) {
+		throw new Error(
+			`Hybrid scout produced no usable repo map (ok=${scout.ok}, exitCode=${scout.exitCode}). See ${config.stateDir}/repo-map.md. Re-run /hybrid-run to retry the design stage.`,
+		);
+	}
+
 	notify?.("Hybrid start: running frontier architect...", "info");
 	const architectSteering = hybridSteeringMarkdown(cwd, config);
 	if (architectSteering)
@@ -7044,6 +6771,15 @@ async function runHybridStart(
 		"frontier-design.md",
 		`# Frontier Design Package\n\n${architect.text || "(no output)"}\n\n---\n\n## Architect run\n\n- ok: ${architect.ok}\n- exitCode: ${architect.exitCode}\n- usage: ${formatUsage(architect)}\n\n\`\`\`stderr\n${truncateMiddle(architect.stderr, 4000)}\n\`\`\`\n`,
 	);
+	// Guard before createProgressFromDesign writes progress.json: an unusable architect run
+	// leaves a "(no output)" design that would otherwise pass the design-stage readiness check
+	// (frontier-design.md + progress.json present) and be skipped on resume. Throwing here
+	// keeps progress.json unwritten, so design readiness stays false and the stage re-runs.
+	if (!isUsableChildResult(architect)) {
+		throw new Error(
+			`Hybrid frontier architect produced no usable design (ok=${architect.ok}, exitCode=${architect.exitCode}). See ${config.stateDir}/frontier-design.md. The design stage was not completed; re-run /hybrid-run to retry.`,
+		);
+	}
 	state.phase = "designed";
 	state.lastRun = nowIso();
 	saveState(cwd, config, state);
@@ -7205,12 +6941,42 @@ async function runLocalLoop(
 	return testPassed;
 }
 
+interface ImplementationReviewer {
+	model: string;
+	thinking?: string;
+	roleLabel: string;
+	artifactTitle: string;
+}
+
+// Default reviewer is the frontier model: used by /hybrid-run's auto loop and the
+// manual /hybrid-review command, where a frontier implementation review is intended.
+// hybrid_exec (parent-driven skill mode) overrides this with the local reviewer so
+// frontier tokens are reserved for the explicit /hybrid-final gate.
+function frontierImplementationReviewer(config: HarnessConfig): ImplementationReviewer {
+	return {
+		model: config.frontierModel,
+		thinking: config.frontierThinking,
+		roleLabel: "FRONTIER IMPLEMENTATION REVIEWER",
+		artifactTitle: "Frontier Implementation Review",
+	};
+}
+
+function localImplementationReviewer(config: HarnessConfig): ImplementationReviewer {
+	return {
+		model: config.localReviewerModel,
+		thinking: undefined,
+		roleLabel: "LOCAL IMPLEMENTATION REVIEWER",
+		artifactTitle: "Local Implementation Review",
+	};
+}
+
 async function runLocalReview(
 	cwd: string,
 	config: HarnessConfig,
 	state: HarnessState,
 	notify?: Notify,
 	liveLog?: LiveLog,
+	reviewer: ImplementationReviewer = frontierImplementationReviewer(config),
 ): Promise<{
 	verdict: ReturnType<typeof parseLocalVerdict>;
 	result: PiRunResult;
@@ -7223,7 +6989,7 @@ async function runLocalReview(
 	if (steering) markHybridSteeringConsumed(cwd, config, "local-review");
 	const requirementsContext = hybridRequirementsContext(cwd, config, 30_000);
 	const prompt = [
-		"You are the FRONTIER IMPLEMENTATION REVIEWER in a hybrid coding harness.",
+		`You are the ${reviewer.roleLabel} in a hybrid coding harness.`,
 		"Review the implementation against the frontier design. You are read-only. Do not modify files.",
 		"Be strict about test evidence, regressions, edge cases, and design drift.",
 		"",
@@ -7260,11 +7026,11 @@ async function runLocalReview(
 			? "Strict interactive/runtime policy is ACTIVE: if there is no passing configured deterministic test command or equivalent objective runtime assertion in test-evidence.md, you MUST return FAIL. Do not accept syntax checks, HTTP 200 checks, screenshots without assertions, or worker self-reported smoke tests as sufficient for browser/UI/game/gameplay behavior."
 			: "Strict interactive/runtime policy is not active for this task.",
 	].join("\n");
-	notify?.("Hybrid frontier implementation reviewer running...", "info");
+	notify?.(`Hybrid ${reviewer.roleLabel.toLowerCase()} running...`, "info");
 	const review = await runPiOnce({
 		cwd,
-		model: config.frontierModel,
-		thinking: config.frontierThinking,
+		model: reviewer.model,
+		thinking: reviewer.thinking,
 		prompt,
 		tools: ["read", "grep", "find", "ls", "bash"],
 		timeoutMs: 20 * 60_000,
@@ -7281,7 +7047,7 @@ async function runLocalReview(
 		config,
 		state,
 		"local-review.md",
-		`# Frontier Implementation Review\n\n${review.text || "(no output)"}${policyOverride}\n\n---\n\n- ok: ${review.ok}\n- exitCode: ${review.exitCode}\n- usage: ${formatUsage(review)}\n\n\`\`\`stderr\n${truncateMiddle(review.stderr, 4000)}\n\`\`\`\n`,
+		`# ${reviewer.artifactTitle}\n\n${review.text || "(no output)"}${policyOverride}\n\n---\n\n- model: ${reviewer.model}\n- ok: ${review.ok}\n- exitCode: ${review.exitCode}\n- usage: ${formatUsage(review)}\n\n\`\`\`stderr\n${truncateMiddle(review.stderr, 4000)}\n\`\`\`\n`,
 	);
 	state.phase = "local-reviewed";
 	state.lastRun = nowIso();
@@ -7478,7 +7244,7 @@ function runHandoffValidation(
 	lane: HandoffLane,
 	notify?: Notify,
 ): VerificationSummary {
-	const commands = lane.validationCommands.length
+	const commands: HandoffValidationCommand[] = lane.validationCommands.length
 		? lane.validationCommands
 		: verificationCommands(cwd, config).map((command) => ({ command }));
 	const results: VerificationSummary["commands"] = [];
@@ -8015,7 +7781,18 @@ async function runHybridExecutionPackage(options: {
 		const finish = finishHybridArtifacts(options.cwd, config, state, task, notify);
 		reporter.setProgress(finish.progress);
 		reporter.stage("finish", "done", `verification=${finish.summary.allPassed ? "passed" : finish.summary.commands.length ? "failed" : "not configured"}`);
-		const review = await runLocalReview(options.cwd, config, state, notify, liveLog);
+		// Parent-driven mode: keep per-package review on the local reviewer so frontier
+		// tokens are spent only on the explicit /hybrid-final gate. Deterministic
+		// verification (above) still runs every package. The parent orchestrator (itself
+		// frontier) reads these artifacts and decides the next package.
+		const review = await runLocalReview(
+			options.cwd,
+			config,
+			state,
+			notify,
+			liveLog,
+			localImplementationReviewer(config),
+		);
 		details.localVerdict = review.verdict;
 		reporter.stage("local-review", review.verdict === "FAIL" ? "failed" : "done", localReviewSummary(review.verdict, readArtifact(options.cwd, config, "local-review.md")));
 		writeArtifact(options.cwd, config, state, "usage-summary.md", usageSummaryMarkdown(options.cwd, config));
@@ -8032,10 +7809,12 @@ async function runHybridExecutionPackage(options: {
 				`- writerSessionId: ${runState.writerSessionId}`,
 				`- configuredTestsPassed: ${testPassed}`,
 				`- verificationAllPassed: ${finish.summary.allPassed}`,
+				`- reviewer: ${config.localReviewerModel} (local)`,
 				`- localReviewVerdict: ${review.verdict}`,
 				`- finishedAt: ${nowIso()}`,
 				"",
 				"The parent Pi orchestrator should inspect orchestrator-package.md, progress.json, local-log.md, test-evidence.md, git-summary.md, verification-summary.json, and local-review.md before deciding the next package.",
+				"Per-package review uses the local reviewer; deterministic verification runs every package. Reserve the frontier model for the final ship decision: run /hybrid-final once the whole feature is complete.",
 			].join("\n"),
 		);
 		syncHarnessArtifacts(options.cwd, config, state);
@@ -9209,7 +8988,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			setStatusWidget(ctx, displayReport);
 			const action = ctx?.hasUI && ctx?.ui?.custom
 				? await ctx.ui.custom(
-					(tui: TUI, theme: any, _keybindings: unknown, done: (result: HybridGateAction) => void) =>
+					(tui: TUI, theme: any, _keybindings: unknown, done: (result?: HybridGateAction) => void) =>
 						new HybridReportOverlayComponent(tui, "Hybrid Interview", displayReport, theme, done, {
 							choices: ready ? [] : extractHybridGateChoices(report),
 							ready,
@@ -9328,7 +9107,7 @@ export default async function hybridHarness(pi: ExtensionAPI) {
 			setStatusWidget(ctx, displayReport);
 			const action = ctx?.hasUI && ctx?.ui?.custom
 				? await ctx.ui.custom(
-					(tui: TUI, theme: any, _keybindings: unknown, done: (result: HybridGateAction) => void) =>
+					(tui: TUI, theme: any, _keybindings: unknown, done: (result?: HybridGateAction) => void) =>
 						new HybridReportOverlayComponent(tui, "Hybrid Grill", displayReport, theme, done, {
 							choices: ready ? [] : extractHybridGateChoices(report),
 							ready,

@@ -24,7 +24,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "scripts": {
-    "test": "node --test tests/hybrid-harness-regression.test.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && node --test",
+    "test:unit": "node --test",
     "pack:dry": "npm pack --dry-run",
     "cli": "node ./bin/pi-hybrid-harness.js"
   },
@@ -33,9 +35,14 @@
   },
   "files": [
     "extensions",
+    "src",
     "skills",
     "bin",
     "README.md",
     "package.json"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
 }
