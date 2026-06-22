@@ -184,6 +184,37 @@ test("hybrid live monitor prioritizes Korean interactive status", () => {
 	assert.match(source, /승인 기준/);
 });
 
+test("spinner animates on a fixed time bucket, not per render (anti-flicker)", () => {
+	const seedBlock = between("function hybridRunningSeed", "function themeBold");
+	// frame advances on a wall-clock bucket so consecutive renders return the same frame
+	assert.match(seedBlock, /Math\.floor\(Date\.now\(\) \/ HYBRID_SPINNER_BUCKET_MS\)/);
+	// must NOT derive the frame from elapsed-ms-since-update (changed every render)
+	assert.doesNotMatch(seedBlock, /now - Date\.parse/);
+	assert.match(source, /const HYBRID_SPINNER_BUCKET_MS = \d+/);
+	// the inline live card rebuilds only on version/bucket change, not every render
+	const liveBlock = between("class HybridLiveMessageComponent", "function summaryValue");
+	assert.match(liveBlock, /private lastBucket = -1/);
+	assert.match(liveBlock, /bucket !== this\.lastBucket/);
+	assert.doesNotMatch(liveBlock, /\|\| details\.status === "running"\) \{/);
+	// only animate a live, in-process run; a card restored after a Pi restart (no store
+	// snapshot) must freeze so it does not reflow the transcript on every keystroke
+	assert.match(liveBlock, /const live = snapshot !== undefined/);
+	assert.match(liveBlock, /live && details\.status === "running"/);
+
+	// the card builder is static by default: only the live message card opts into
+	// animation. The tool-result renderer (renderResult, called every repaint with no
+	// caching) must build statically or it churns the transcript on every keystroke.
+	const containerBlock = between("function buildHybridRunContainer", "function hybridDetailsToMarkdown");
+	assert.match(containerBlock, /animate = false/);
+	// non-animating render freezes the clock so durations/spinner are deterministic
+	assert.match(containerBlock, /animate\s*\n?\s*\?\s*Date\.now\(\)/);
+	assert.match(containerBlock, /Date\.parse\(details\.finishedAt \?\? details\.updatedAt\)/);
+	assert.match(containerBlock, /animate && isRunning \? hybridRunningSeed\(details\)/);
+	const resultBlock = between("function renderHybridRunResult", "function getHybridLiveStore");
+	// tool-result card must NOT request animation
+	assert.doesNotMatch(resultBlock, /buildHybridRunComponent\([^)]*,\s*true\)/);
+});
+
 test("progress reconciliation accepts completion aliases and rewrites canonical markdown", () => {
 	// Status normalizers now live in src/progress-status.ts (alias behavior such as
 	// "complete" -> done is covered by src-progress-status.test.ts); assert wiring here.

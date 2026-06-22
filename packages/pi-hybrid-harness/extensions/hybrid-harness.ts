@@ -3501,23 +3501,14 @@ function runningGlyph(seed?: number): string {
 	return RUNNING_FRAMES[Math.abs(seed) % RUNNING_FRAMES.length]!;
 }
 
-function hybridRunningSeed(details: HybridRunDetails): number | undefined {
-	let seed: number | undefined;
-	const now = Date.now();
-	seed = runningSeed(seed, details.updatedAt ? now - Date.parse(details.updatedAt) : undefined);
-	for (const child of Object.values(details.children)) {
-		seed = runningSeed(seed, child.updatedAt ? now - Date.parse(child.updatedAt) : undefined);
-	}
-	return seed;
-}
-
-function runningSeed(...values: Array<number | undefined>): number | undefined {
-	let seed: number | undefined;
-	for (const value of values) {
-		if (value === undefined || !Number.isFinite(value)) continue;
-		seed = (seed ?? 0) + Math.trunc(value);
-	}
-	return seed;
+// Advance the spinner on a fixed wall-clock cadence (~8 fps) so the frame is
+// identical across the many render ticks that fall within one bucket. The previous
+// implementation derived the frame from elapsed-ms-since-update, which changed on
+// every render and forced a full card repaint on every Pi tick — the cause of the
+// severe flicker. `details` is unused now but kept for call-site compatibility.
+const HYBRID_SPINNER_BUCKET_MS = 120;
+function hybridRunningSeed(_details: HybridRunDetails): number | undefined {
+	return Math.floor(Date.now() / HYBRID_SPINNER_BUCKET_MS);
 }
 
 function themeBold(theme: any, text: string): string {
@@ -4295,6 +4286,7 @@ class HybridRunComponent implements Component {
 		private readonly details: HybridRunDetails,
 		private readonly expanded: boolean,
 		private readonly theme: any,
+		private readonly animate: boolean,
 	) {}
 
 	invalidate(): void {}
@@ -4305,16 +4297,22 @@ class HybridRunComponent implements Component {
 			this.expanded,
 			this.theme,
 			width,
+			this.animate,
 		).render(width);
 	}
 }
 
+// animate=true only for a live, in-process running run (the live message card). A
+// static/historical card (tool result, restored card, finished run) must render
+// deterministically — no spinner, durations frozen — so it does not churn the
+// transcript on every repaint/keystroke.
 function buildHybridRunComponent(
 	details: HybridRunDetails,
 	expanded: boolean,
 	theme: any,
+	animate = false,
 ): Component {
-	return new HybridRunComponent(details, expanded, theme);
+	return new HybridRunComponent(details, expanded, theme, animate);
 }
 
 function buildHybridRunContainer(
@@ -4322,15 +4320,20 @@ function buildHybridRunContainer(
 	expanded: boolean,
 	theme: any,
 	renderWidth: number,
+	animate = false,
 ): Component {
 	const w = Math.max(20, renderWidth - 4);
 	const fit = (text: string) => truncLine(text, w);
-	const now = Date.now();
+	// When not animating, freeze the clock to the run's last-known time so durations
+	// and spinners are deterministic across repaints (no per-keystroke churn).
+	const now = animate
+		? Date.now()
+		: Date.parse(details.finishedAt ?? details.updatedAt) || Date.now();
 
 	// Status glyph
 	const isRunning = details.status === "running";
 	const hasError = details.status === "failed";
-	const seed = isRunning ? hybridRunningSeed(details) : undefined;
+	const seed = animate && isRunning ? hybridRunningSeed(details) : undefined;
 
 	const c = new Container();
 
@@ -4369,7 +4372,7 @@ function buildHybridRunContainer(
 	}
 
 	// Stage list
-	const runningStageSeed = hybridRunningSeed(details);
+	const runningStageSeed = animate ? hybridRunningSeed(details) : undefined;
 	let stageIdx = 0;
 	c.addChild(new Text(fit(theme.fg("accent", themeBold(theme, "단계 흐름"))), 0, 0));
 	for (const stage of details.stages) {
@@ -5818,6 +5821,7 @@ class HybridMonitorOverlayComponent implements Component {
 
 class HybridLiveMessageComponent implements Component {
 	private lastVersion = -1;
+	private lastBucket = -1;
 	private inner: Component = new Text("", 0, 0);
 
 	constructor(
@@ -5831,15 +5835,38 @@ class HybridLiveMessageComponent implements Component {
 
 	render(width: number): string[] {
 		const snapshot = getHybridLiveStore().get(this.liveId);
+		// A live snapshot exists only for a run in THIS process. After a Pi restart the
+		// in-memory store is empty, so a restored (or orphaned) card has no snapshot and
+		// falls back to its send-time details (status "running"). Such a card must be
+		// frozen — otherwise it keeps re-animating and reflows the transcript on every
+		// keystroke ("screen scrolls on every input").
+		const live = snapshot !== undefined;
 		const details = normalizeHybridRunDetailsForRender(
 			snapshot?.details ?? this.fallback,
 		);
 		const version = snapshot?.version ?? 0;
 		if (!details)
 			return [`Hybrid run ${this.liveId}: waiting for first update...`];
-		if (version !== this.lastVersion || details.status === "running") {
+		// Animate (rebuild once per spinner bucket) only for a live, running run.
+		// Otherwise rebuild only when the snapshot version changes; a frozen card returns
+		// identical cached lines every render, so typing does not churn the transcript.
+		const bucket =
+			live && details.status === "running"
+				? Math.floor(Date.now() / HYBRID_SPINNER_BUCKET_MS)
+				: this.lastBucket;
+		if (
+			this.lastVersion === -1 ||
+			version !== this.lastVersion ||
+			bucket !== this.lastBucket
+		) {
 			this.lastVersion = version;
-			this.inner = buildHybridRunComponent(details, this.expanded, this.theme);
+			this.lastBucket = bucket;
+			this.inner = buildHybridRunComponent(
+				details,
+				this.expanded,
+				this.theme,
+				live && details.status === "running",
+			);
 		}
 		return this.inner.render(width);
 	}
